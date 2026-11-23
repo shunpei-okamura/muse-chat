@@ -499,6 +499,24 @@ app.post('/api/bridge/dismiss', bridgeAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// bridge admin (global bridge only): member/message cleanup
+app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
+  if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
+  const roomId = req.body && req.body.room_id;
+  const profileId = req.body && req.body.profile_id;
+  db.members = db.members.filter(m => !(m.roomId === roomId && m.profileId === profileId));
+  db.notifications = db.notifications.filter(n => !(n.roomId === roomId && n.profileId === profileId));
+  save();
+  res.json({ ok: true });
+});
+app.post('/api/bridge/admin/delete-message', bridgeAuth, (req, res) => {
+  if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
+  const messageId = req.body && req.body.message_id;
+  db.messages = db.messages.filter(m => m.id !== messageId);
+  save();
+  res.json({ ok: true });
+});
+
 // app icon (PNG, embedded so install icons work without extra files)
 const ICON_PNG_B64 = [
   'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAPo0lEQVR4nO3cUbLTNhiGYR+mA1ui',
