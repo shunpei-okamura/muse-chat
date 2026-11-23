@@ -577,7 +577,6 @@ function wakeWaiters(req) {
     if (!w.res.headersSent) w.res.json({ pending });
     if (pending.length) return;
   }
-  
 }
 function finishRequest(r, state = 'done') {
   r.status = state === 'expired' ? 'expired' : 'done';
