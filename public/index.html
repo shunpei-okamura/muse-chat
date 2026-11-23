@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="stylesheet" href="/style.css?v=4.1">
+<link rel="stylesheet" href="/style.css?v=4.2">
 </head>
 <body>
 
@@ -63,14 +63,18 @@
     <button id="call-kapio-btn" class="sub-btn">Museを呼ぶ</button>
   </div>
   <div id="message-list" class="message-list"></div>
+  <div id="reply-bar" class="reply-bar hidden">
+    <span id="reply-bar-text"></span>
+    <button id="reply-bar-cancel" class="sub-btn">✕</button>
+  </div>
   <div id="image-preview" class="image-preview hidden">
-    <img id="image-preview-img" alt="添付画像">
-    <span class="note">この画像を送信します</span>
-    <button id="image-preview-remove" class="sub-btn">✕ 外す</button>
+    <div id="image-thumbs" class="image-thumbs"></div>
+    <span class="note" id="image-preview-note">この画像を送信します</span>
+    <button id="image-preview-remove" class="sub-btn">✕ 全部外す</button>
   </div>
   <footer class="composer">
     <button id="image-btn" class="icon-btn" title="画像を送る">📷</button>
-    <input id="image-input" type="file" accept="image/*" class="hidden">
+    <input id="image-input" type="file" accept="image/*" multiple class="hidden">
     <textarea id="composer-input" rows="1" placeholder="メッセージを入力"></textarea>
     <button id="send-btn" class="send-btn">送信</button>
   </footer>
@@ -183,6 +187,6 @@
   </div>
 </div>
 
-<script src="/app.js?v=4.1"></script>
+<script src="/app.js?v=4.2"></script>
 </body>
 </html>
