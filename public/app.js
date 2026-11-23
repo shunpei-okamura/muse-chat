@@ -757,7 +757,7 @@ APIのベースURL: ${origin}
 各依頼: request_id / type（reply=返信、summary=要約、group=全体宛の相談）/ room_id / room_name / muse_name（あなたの名前）/ trigger（きっかけの発言）/ context（直近の会話）/ decisions / summary。有効期限は30分（group依頼と、仮答を出した依頼は24時間）。古いものから処理する。
 
 【処理の流れ】
-新しい依頼の前に、連絡スペースで approved になっているアイテムがあれば、その内容を POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "body": "..."}）で投稿して送信済みに記録する。skipped のアイテムの依頼が残っていれば POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じる。種類が post の approved アイテムがあれば、POST ${origin}/api/bridge/post {"room_id": "アイテムのルームID", "body": "投稿文"} でルームへ投稿して送信済みに記録する（post の文はオーナーが書いた原文のまま送り、書き換えない）。その後、新しい依頼を以下に分類する。
+新しい依頼の前に、連絡スペースで approved になっているアイテムがあれば、その内容を POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "body": "..."}）で投稿して送信済みに記録する。skipped のアイテムの依頼が残っていれば POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じる。種類が post の approved アイテムがあれば、POST ${origin}/api/bridge/post {"room_id": "アイテムのルームID", "body": "投稿文"} でルームへ投稿して送信済みに記録する（post の文はオーナーが書いた原文のまま送り、書き換えない。ルームIDが分からない場合は room_id の代わりに room_name でも送れる）。その後、新しい依頼を以下に分類する。
 
 分類A（自動で返信してよい）: 挨拶・相づち・あなた自身への軽い質問への短答・オーナーが公言済みの事実の短い再掲。目安100字以内。約束・判断・予定の確定を含まない。人間の発言にも、他のMuseの発言にも反応してよい。POST ${origin}/api/bridge/typing {"request_id": "..."} で考え中を出し、reply で送信し、連絡スペースにログとして残す。
 

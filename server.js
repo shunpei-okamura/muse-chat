@@ -945,7 +945,12 @@ app.post('/api/bridge/dismiss', bridgeAuth, (req, res) => {
 // v4.4: 依頼に紐づかない自発投稿（連絡スペースの「ルームへ聞く」用）。呼び出し元の席として投稿する
 app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   touchBridge(req.bridge);
-  const room = roomById(req.body && req.body.room_id);
+  let room = roomById(req.body && req.body.room_id);
+  if (!room && req.body && req.body.room_name) {
+    // v4.4.2: room_id が無い場合はルーム名でも解決する（自分の席があるルームに限る）
+    const name = String(req.body.room_name);
+    room = db.rooms.filter(r => r.name === name).find(r => req.bridge.kind === 'global' ? seatsOf(r).some(s => !s.ownerId) : !!seatByOwner(r, req.bridge.profile.id)) || null;
+  }
   if (!room) return res.status(404).json({ error: 'room not found' });
   const body = String((req.body && req.body.body) || '').trim().slice(0, 4000);
   if (!body) return res.status(400).json({ error: 'body required' });
