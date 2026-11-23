@@ -63,11 +63,21 @@
     <button id="call-kapio-btn" class="sub-btn">Museを呼ぶ</button>
   </div>
   <div id="message-list" class="message-list"></div>
+  <div id="image-preview" class="image-preview hidden">
+    <img id="image-preview-img" alt="添付画像">
+    <span class="note">この画像を送信します</span>
+    <button id="image-preview-remove" class="sub-btn">✕ 外す</button>
+  </div>
   <footer class="composer">
+    <button id="image-btn" class="icon-btn" title="画像を送る">📷</button>
+    <input id="image-input" type="file" accept="image/*" class="hidden">
     <textarea id="composer-input" rows="1" placeholder="メッセージを入力"></textarea>
     <button id="send-btn" class="send-btn">送信</button>
   </footer>
 </section>
+
+<!-- 画像ビューア -->
+<div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="画像"></div>
 
 <!-- 通知センター -->
 <section id="view-notifications" class="view hidden">
@@ -144,7 +154,7 @@
     </label>
     <div class="summary-box">
       <h3>最新の要約</h3>
-      <p id="settings-summary" class="summary-text">まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。</p>
+      <p id="settings-summary" class="summary-text">まだ要約はありません。「📋 会話を要約」を押すとカピおが作ります。</p>
       <h3>決まったこと・約束</h3>
       <ul id="decision-list" class="decision-list"></ul>
       <div class="join-box">
