@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Muse対応チャット</title>
+<meta name="theme-color" content="#06c755">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- 初回設定 -->
+<section id="view-setup" class="view hidden">
+  <div class="setup-box">
+    <div class="logo">💬</div>
+    <h1>Muse対応チャットへようこそ</h1>
+    <p class="sub">身内専用の小さなチャットです。<br>まずは表示名を決めてください（パスワードはありません）。</p>
+    <p id="join-notice" class="join-notice hidden"></p>
+    <input id="setup-name" type="text" maxlength="30" placeholder="表示名（例：しゅんぺい）" autocomplete="name">
+    <button id="setup-btn" class="primary-btn">はじめる</button>
+    <p class="note">※ ブラウザを閉じている間のプッシュ通知は未対応です。開いている間は通知します。</p>
+  </div>
+</section>
+
+<!-- ルーム一覧 -->
+<section id="view-rooms" class="view hidden">
+  <header class="app-header">
+    <h1>トーク</h1>
+    <div class="header-actions">
+      <button id="bell-btn" class="icon-btn" title="通知">🔔<span id="bell-badge" class="badge hidden">0</span></button>
+      <button id="me-btn" class="icon-btn" title="自分">👤</button>
+    </div>
+  </header>
+  <div class="rooms-tools">
+    <button id="create-room-btn" class="primary-btn small">＋ ルームを作る</button>
+    <div class="join-box">
+      <input id="join-code-input" type="text" maxlength="6" placeholder="招待コード">
+      <button id="join-code-btn" class="sub-btn">コードで参加</button>
+    </div>
+  </div>
+  <ul id="room-list" class="room-list"></ul>
+  <p id="rooms-empty" class="empty hidden">まだルームがありません。「ルームを作る」から始めましょう。</p>
+</section>
+
+<!-- チャット -->
+<section id="view-chat" class="view hidden">
+  <header class="app-header chat-header">
+    <button id="back-btn" class="icon-btn">←</button>
+    <h1 id="chat-title">ルーム</h1>
+    <div class="header-actions">
+      <button id="summary-btn" class="icon-btn" title="会話を要約">📋</button>
+      <button id="room-settings-btn" class="icon-btn" title="ルーム設定">⚙️</button>
+    </div>
+  </header>
+  <div id="kapio-bar" class="kapio-bar hidden">
+    <span id="kapio-status"></span>
+    <button id="call-kapio-btn" class="sub-btn">カピおを呼ぶ</button>
+  </div>
+  <div id="message-list" class="message-list"></div>
+  <footer class="composer">
+    <textarea id="composer-input" rows="1" placeholder="メッセージを入力"></textarea>
+    <button id="send-btn" class="send-btn">送信</button>
+  </footer>
+</section>
+
+<!-- 通知センター -->
+<section id="view-notifications" class="view hidden">
+  <header class="app-header">
+    <button id="notif-back-btn" class="icon-btn">←</button>
+    <h1>通知</h1>
+    <div class="header-actions">
+      <button id="notif-readall-btn" class="sub-btn">全て既読</button>
+    </div>
+  </header>
+  <div class="notif-actions">
+    <button id="enable-notif-btn" class="sub-btn">ブラウザ通知を許可する</button>
+    <p class="note">通知はこのページを開いている間だけ届きます。閉じている間のプッシュ通知は未対応で、次に開いたときにここで確認できます。</p>
+  </div>
+  <ul id="notification-list" class="notification-list"></ul>
+  <p id="notif-empty" class="empty hidden">通知はありません。</p>
+</section>
+
+<!-- ルーム作成モーダル -->
+<div id="modal-create" class="modal hidden">
+  <div class="modal-card">
+    <h2>ルームを作る</h2>
+    <label>ルーム名<input id="create-name" type="text" maxlength="50" placeholder="例：週末の予定"></label>
+    <label class="check"><input id="create-kapio" type="checkbox" checked> カピおを同席させる</label>
+    <label>カピおの返信スタイル
+      <select id="create-kapio-mode">
+        <option value="mention">「カピお」と呼ばれたときだけ</option>
+        <option value="auto">会話を見て自動で口を出す</option>
+      </select>
+    </label>
+    <div class="modal-btns">
+      <button class="sub-btn" data-close>キャンセル</button>
+      <button id="create-submit" class="primary-btn small">作成</button>
+    </div>
+  </div>
+</div>
+
+<!-- ルーム設定モーダル -->
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-card">
+    <h2>ルーム設定</h2>
+    <label>ルーム名<input id="settings-name" type="text" maxlength="50"></label>
+    <div class="invite-box">
+      <div>招待コード：<strong id="settings-code"></strong></div>
+      <div class="invite-link-row">
+        <input id="settings-link" type="text" readonly>
+        <button id="copy-link-btn" class="sub-btn">コピー</button>
+      </div>
+      <p class="note">このリンクを友達に送ると、表示名を決めてそのまま参加できます。</p>
+    </div>
+    <div>メンバー：<span id="settings-members"></span></div>
+    <label class="check"><input id="settings-kapio" type="checkbox"> カピおを同席させる</label>
+    <label>カピおの返信スタイル
+      <select id="settings-kapio-mode">
+        <option value="mention">「カピお」と呼ばれたときだけ</option>
+        <option value="auto">会話を見て自動で口を出す</option>
+      </select>
+    </label>
+    <div class="summary-box">
+      <h3>最新の要約</h3>
+      <p id="settings-summary" class="summary-text">まだ要約はありません。「📋 会話を要約」を押すとカピおが作ります。</p>
+      <h3>決まったこと・約束</h3>
+      <ul id="decision-list" class="decision-list"></ul>
+      <div class="join-box">
+        <input id="decision-input" type="text" maxlength="300" placeholder="手動で追加">
+        <button id="decision-add-btn" class="sub-btn">追加</button>
+      </div>
+    </div>
+    <div class="modal-btns">
+      <button class="sub-btn" data-close>閉じる</button>
+      <button id="settings-save" class="primary-btn small">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 自分モーダル -->
+<div id="modal-me" class="modal hidden">
+  <div class="modal-card">
+    <h2>自分の情報</h2>
+    <p>表示名：<strong id="me-name"></strong></p>
+    <p class="note">この端末のブラウザに保存された情報で識別しています。別の端末では別の参加者として入ります。</p>
+    <div class="modal-btns">
+      <button class="sub-btn" data-close>閉じる</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
