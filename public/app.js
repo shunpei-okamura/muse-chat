@@ -15,7 +15,9 @@ let ws = null;
 let wsConnecting = false;
 let currentRoom = null;
 let roomsCache = [];
-let pendingImage = null;
+let pendingImages = [];
+let replyTargetId = null;
+let unreadStartSeq = 0;
 let chatMessages = [];
 let pushActive = false;
 const joinMatch = location.pathname.match(/^\/join\/([A-Za-z0-9]+)/);
@@ -244,11 +246,17 @@ async function openRoom(roomId) {
   activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type }]));
   renderMuseBar();
   renderMuseActivity();
+  const me = (detail.members || []).find(x => x.id === profile.id);
+  const myLastRead = me ? (me.lastReadSeq || 0) : 0;
   const msgs = await api(`/api/rooms/${roomId}/messages`);
+  const firstUnread = msgs.find(m => (m.seq || 0) > myLastRead && m.senderId !== profile.id && m.type !== 'system');
+  unreadStartSeq = firstUnread ? firstUnread.seq : 0;
   renderAllMessages(msgs);
-  clearPendingImage();
+  clearPendingImages();
+  restoreDraft(roomId);
   show('#view-chat');
-  scrollChat();
+  const sep = document.querySelector('.unread-sep');
+  if (sep) sep.scrollIntoView({ block: 'start' }); else scrollChat();
   if (document.visibilityState === 'visible') await api(`/api/rooms/${roomId}/read`, { method: 'POST' });
   refreshBell();
 }
@@ -302,10 +310,25 @@ function renderMessage(m) {
   attachLongPress(row.querySelector('.msg-bubble'), m.id);
   return row;
 }
+const dayKey = (iso) => { const d = new Date(iso); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+const dayLabel = (iso) => new Date(iso).toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' });
 function appendMessage(m) {
   const list = $('#message-list');
   if (m.id && list.querySelector(`[data-msg-id="${CSS.escape(m.id)}"]`)) return;
   if (m.deleted) return;
+  const prev = chatMessages[chatMessages.length - 1];
+  if (!prev || dayKey(prev.createdAt) !== dayKey(m.createdAt)) {
+    const sep = document.createElement('div');
+    sep.className = 'day-sep';
+    sep.innerHTML = `<span>${esc(dayLabel(m.createdAt))}</span>`;
+    list.appendChild(sep);
+  }
+  if (unreadStartSeq && m.seq === unreadStartSeq && !list.querySelector('.unread-sep')) {
+    const sep = document.createElement('div');
+    sep.className = 'unread-sep';
+    sep.textContent = 'ここから未読';
+    list.appendChild(sep);
+  }
   chatMessages.push(m);
   list.appendChild(renderMessage(m));
   if (m.senderId === profile.id) updateReadReceipts();
@@ -373,6 +396,7 @@ async function syncMissed() {
 const sheet = document.createElement('div');
 sheet.className = 'sheet hidden';
 sheet.innerHTML = `<div class="sheet-card">
+  <button data-act="reply">返信</button>
   <button data-act="copy">コピー</button>
   <button data-act="unsend" class="danger">送信取消</button>
   <button data-act="cancel">キャンセル</button>
@@ -383,9 +407,11 @@ function openSheet(msgId) {
   const m = findMsg(msgId);
   if (!m) return;
   sheetMsgId = msgId;
+  const canReply = m.type !== 'system' && m.type !== 'unsent';
+  sheet.querySelector('[data-act="reply"]').classList.toggle('hidden', !canReply);
   sheet.querySelector('[data-act="copy"]').classList.toggle('hidden', !m.body);
   sheet.querySelector('[data-act="unsend"]').classList.toggle('hidden', !canUnsend(m));
-  if (!m.body && !canUnsend(m)) return;
+  if (!canReply && !m.body && !canUnsend(m)) return;
   sheet.classList.remove('hidden');
 }
 function closeSheet() { sheet.classList.add('hidden'); sheetMsgId = null; }
@@ -395,7 +421,9 @@ sheet.addEventListener('click', async (e) => {
   const m = findMsg(sheetMsgId);
   closeSheet();
   if (!m) return;
-  if (act === 'copy') {
+  if (act === 'reply') {
+    setReplyTarget(m, true);
+  } else if (act === 'copy') {
     try { await navigator.clipboard.writeText(m.body); } catch { /* ignore */ }
   } else if (act === 'unsend') {
     const museHere = !!currentRoom?.museSeat?.active;
@@ -422,39 +450,120 @@ function attachLongPress(el, msgId) {
   el.addEventListener('contextmenu', (e) => { e.preventDefault(); cancel(); openSheet(msgId); });
 }
 
+// ---------- reply target + drafts (v4.2) ----------
+function setReplyTarget(m, focus = false) {
+  replyTargetId = m ? m.id : null;
+  const bar = $('#reply-bar');
+  if (!m) { bar.classList.add('hidden'); }
+  else {
+    $('#reply-bar-text').textContent = `返信: ${m.senderName}: ${(m.body || (m.image ? '画像' : '')).slice(0, 40)}`;
+    bar.classList.remove('hidden');
+    if (focus) $('#composer-input').focus();
+  }
+  saveDraft();
+}
+$('#reply-bar-cancel').addEventListener('click', () => setReplyTarget(null));
+function loadDrafts() { try { return JSON.parse(localStorage.getItem('mc_drafts') || '{}'); } catch { return {}; } }
+function saveDraft() {
+  if (!currentRoom) return;
+  const drafts = loadDrafts();
+  const text = $('#composer-input').value;
+  if (text || replyTargetId) drafts[currentRoom.id] = { text, replyTo: replyTargetId };
+  else delete drafts[currentRoom.id];
+  try { localStorage.setItem('mc_drafts', JSON.stringify(drafts)); } catch { /* ignore */ }
+}
+function clearDraft(roomId) {
+  const drafts = loadDrafts();
+  delete drafts[roomId];
+  try { localStorage.setItem('mc_drafts', JSON.stringify(drafts)); } catch { /* ignore */ }
+}
+function restoreDraft(roomId) {
+  const d = loadDrafts()[roomId];
+  const ta = $('#composer-input');
+  ta.value = d ? (d.text || '') : '';
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + 'px';
+  replyTargetId = null;
+  $('#reply-bar').classList.add('hidden');
+  if (d && d.replyTo) { const m = findMsg(d.replyTo); if (m) setReplyTarget(m); }
+}
+
 // ---------- send ----------
-function sendCurrent() {
+let sending = false;
+async function sendCurrent() {
   const ta = $('#composer-input');
   const body = ta.value.trim();
-  if (!currentRoom || (!body && !pendingImage)) return;
-  ta.value = '';
-  ta.style.height = 'auto';
-  if (pendingImage) {
-    const image = pendingImage;
-    clearPendingImage();
-    api(`/api/rooms/${currentRoom.id}/messages`, { method: 'POST', body: JSON.stringify({ body, image }) })
-      .then(m => { appendMessage(m); scrollChat(); })
-      .catch(e => alert('画像の送信に失敗しました: ' + e.message));
+  if (!currentRoom || sending || (!body && !pendingImages.length)) return;
+  const roomId = currentRoom.id;
+  const replyTo = replyTargetId;
+  if (pendingImages.length) {
+    sending = true;
+    $('#send-btn').disabled = true;
+    const images = pendingImages.slice();
+    clearPendingImages();
+    ta.value = '';
+    ta.style.height = 'auto';
+    setReplyTarget(null);
+    clearDraft(roomId);
+    try {
+      for (let i = 0; i < images.length; i++) {
+        const payload = { image: images[i] };
+        if (i === 0) { if (body) payload.body = body; if (replyTo) payload.replyTo = replyTo; }
+        const m = await api(`/api/rooms/${roomId}/messages`, { method: 'POST', body: JSON.stringify(payload) });
+        if (currentRoom && currentRoom.id === roomId) { appendMessage(m); scrollChat(); }
+      }
+    } catch (e) {
+      alert('画像の送信に失敗しました: ' + e.message);
+    } finally {
+      sending = false;
+      $('#send-btn').disabled = false;
+    }
     return;
   }
+  ta.value = '';
+  ta.style.height = 'auto';
+  setReplyTarget(null);
+  clearDraft(roomId);
   if (ws && ws.readyState === 1) {
-    ws.send(JSON.stringify({ type: 'send', roomId: currentRoom.id, body }));
+    ws.send(JSON.stringify({ type: 'send', roomId, body, ...(replyTo ? { replyTo } : {}) }));
   } else {
-    api(`/api/rooms/${currentRoom.id}/messages`, { method: 'POST', body: JSON.stringify({ body }) })
+    api(`/api/rooms/${roomId}/messages`, { method: 'POST', body: JSON.stringify({ body, ...(replyTo ? { replyTo } : {}) }) })
       .then(m => { appendMessage(m); scrollChat(); })
-      .catch(e => { ta.value = body; alert('送信できませんでした: ' + e.message); });
+      .catch(e => { ta.value = body; saveDraft(); alert('送信できませんでした: ' + e.message); });
   }
 }
 
 // ---------- image attach ----------
-function clearPendingImage() {
-  pendingImage = null;
+const MAX_PENDING_IMAGES = 4;
+function renderPendingImages() {
   const bar = $('#image-preview');
-  if (bar) bar.classList.add('hidden');
-  const img = $('#image-preview-img');
-  if (img) img.removeAttribute('src');
+  const wrap = $('#image-thumbs');
+  if (!bar || !wrap) return;
+  wrap.innerHTML = '';
+  pendingImages.forEach((src, i) => {
+    const t = document.createElement('div');
+    t.className = 'img-thumb';
+    const img = document.createElement('img');
+    img.src = src;
+    img.alt = '添付画像';
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'img-thumb-x';
+    x.textContent = '✕';
+    x.setAttribute('aria-label', 'この画像を外す');
+    x.addEventListener('click', () => { pendingImages.splice(i, 1); renderPendingImages(); });
+    t.appendChild(img);
+    t.appendChild(x);
+    wrap.appendChild(t);
+  });
+  $('#image-preview-note').textContent = pendingImages.length > 1 ? `${pendingImages.length}枚の画像を送信します` : 'この画像を送信します';
+  bar.classList.toggle('hidden', pendingImages.length === 0);
   const input = $('#image-input');
   if (input) input.value = '';
+}
+function clearPendingImages() {
+  pendingImages = [];
+  renderPendingImages();
 }
 function downscaleToDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -477,21 +586,22 @@ function downscaleToDataUrl(file) {
 }
 $('#image-btn').addEventListener('click', () => $('#image-input').click());
 $('#image-input').addEventListener('change', async (e) => {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  try {
-    pendingImage = await downscaleToDataUrl(file);
-    $('#image-preview-img').src = pendingImage;
-    $('#image-preview').classList.remove('hidden');
-  } catch { alert('画像を読み込めませんでした'); }
+  const files = [...(e.target.files || [])];
+  e.target.value = '';
+  for (const file of files) {
+    if (pendingImages.length >= MAX_PENDING_IMAGES) { alert(`画像は一度に${MAX_PENDING_IMAGES}枚までです`); break; }
+    try { pendingImages.push(await downscaleToDataUrl(file)); }
+    catch { alert('画像を読み込めませんでした'); }
+  }
+  renderPendingImages();
 });
-$('#image-preview-remove').addEventListener('click', clearPendingImage);
+$('#image-preview-remove').addEventListener('click', clearPendingImages);
 $('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
 $('#send-btn').addEventListener('click', sendCurrent);
 $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
 });
-$('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; });
+$('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; saveDraft(); });
 $('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); renderMuseActivity(); show('#view-rooms'); loadRooms(); });
 $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
