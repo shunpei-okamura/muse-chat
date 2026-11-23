@@ -32,24 +32,56 @@ const ENV = loadEnv();
 const PORT = parseInt(ENV.PORT || '8377', 10);
 const BRIDGE_TOKEN = ENV.BRIDGE_TOKEN;
 
-// ---------- DB (JSON file persistence) ----------
+// ---------- DB (JSON persistence: local file + optional Upstash Redis) ----------
 function emptyDb() {
   return { profiles: [], rooms: [], members: [], messages: [], notifications: [], kapioRequests: [], decisions: [], seq: 0 };
 }
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
 let db;
 try {
   db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
 } catch {
   db = emptyDb();
 }
+// Optional external persistence: survives restarts/redeploys on ephemeral hosts (e.g. Render free)
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REMOTE_KEY = 'muse-chat-db-v1';
+async function remoteLoad() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+  try {
+    const res = await fetch(`${UPSTASH_URL}/get/${REMOTE_KEY}`, { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
+    const data = await res.json();
+    if (data && data.result) {
+      const parsed = JSON.parse(data.result);
+      if (parsed && Array.isArray(parsed.profiles)) { db = parsed; return true; }
+    }
+  } catch (e) { console.error('remoteLoad failed', e); }
+  return false;
+}
+let remoteSaveTimer = null;
+function remoteSave() {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = setTimeout(() => {
+    fetch(`${UPSTASH_URL}/set/${REMOTE_KEY}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+      body: JSON.stringify(db),
+    }).catch(e => console.error('remoteSave failed', e));
+  }, 300);
+}
 let saveTimer = null;
 function save() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const tmp = DB_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db, null, 1));
-    fs.renameSync(tmp, DB_FILE);
+    try {
+      const tmp = DB_FILE + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(db, null, 1));
+      fs.renameSync(tmp, DB_FILE);
+    } catch (e) { console.error('file save failed', e); }
   }, 100);
+  remoteSave();
 }
 const id = () => crypto.randomBytes(8).toString('hex');
 const now = () => new Date().toISOString();
@@ -371,11 +403,15 @@ app.use(express.static(path.join(ROOT, 'public'), { maxAge: '1h' }));
 app.get('/join/:code', (req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
 app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
 
-const server = app.listen(PORT, () => console.log(`muse-chat listening on ${PORT}`));
+// ---------- startup: load remote DB before accepting traffic ----------
+async function start() {
+  const loaded = await Promise.race([remoteLoad(), new Promise(r => setTimeout(() => r(false), 5000))]);
+  if (loaded) console.log('loaded DB from remote store');
+  const server = app.listen(PORT, () => console.log(`muse-chat listening on ${PORT}`));
 
 // ---------- WS ----------
 const wss = new WebSocketServer({ server, path: '/ws' });
-wss.on('connection', (ws, req) => {
+  wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://localhost');
   const profile = profileByToken(url.searchParams.get('token'));
   if (!profile) { ws.close(4001, 'unauthorized'); return; }
@@ -401,3 +437,5 @@ wss.on('connection', (ws, req) => {
     if (set) { set.delete(ws); if (!set.size) clients.delete(profile.id); }
   });
 });
+}
+start();
