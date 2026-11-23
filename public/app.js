@@ -47,8 +47,28 @@ async function doSetup() {
 $('#setup-btn').addEventListener('click', doSetup);
 $('#setup-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') doSetup(); });
 
+// ---------- Web Push ----------
+function urlB64ToUint8(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+}
+async function subscribePush() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const { key } = await api('/api/push/public-key');
+    if (!key) return;
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
+    await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub }) });
+  } catch { /* push is best-effort */ }
+}
+
 async function afterLogin() {
   connectWs();
+  subscribePush();
   if (pendingJoinCode) {
     try {
       const room = await api('/api/rooms/join', { method: 'POST', body: JSON.stringify({ code: pendingJoinCode }) });
@@ -288,7 +308,8 @@ $('#notif-readall-btn').addEventListener('click', async () => {
 $('#enable-notif-btn').addEventListener('click', async () => {
   if (!('Notification' in window)) { alert('このブラウザは通知に対応していません'); return; }
   const perm = await Notification.requestPermission();
-  alert(perm === 'granted' ? '通知を許可しました（ページを開いている間のみ届きます）' : '通知は許可されませんでした');
+  if (perm === 'granted') { await subscribePush(); alert('通知を許可しました。閉じている間もプッシュで届きます'); }
+  else alert('通知は許可されませんでした');
 });
 
 // ---------- WebSocket ----------
