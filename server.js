@@ -34,7 +34,12 @@ const BRIDGE_TOKEN = ENV.BRIDGE_TOKEN;
 
 // ---------- DB (JSON persistence: local file + optional Upstash Redis) ----------
 function emptyDb() {
-  return { profiles: [], rooms: [], members: [], messages: [], notifications: [], kapioRequests: [], decisions: [], seq: 0 };
+  return { profiles: [], rooms: [], members: [], messages: [], notifications: [], kapioRequests: [], decisions: [], pushSubs: [], seq: 0 };
+}
+function normalizeDb() {
+  if (!Array.isArray(db.pushSubs)) db.pushSubs = [];
+  if (!Array.isArray(db.decisions)) db.decisions = [];
+  if (!Array.isArray(db.kapioRequests)) db.kapioRequests = [];
 }
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
 let db;
@@ -43,6 +48,7 @@ try {
 } catch {
   db = emptyDb();
 }
+normalizeDb();
 // Optional external persistence: survives restarts/redeploys on ephemeral hosts (e.g. Render free)
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL || '';
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
@@ -54,7 +60,7 @@ async function remoteLoad() {
     const data = await res.json();
     if (data && data.result) {
       const parsed = JSON.parse(data.result);
-      if (parsed && Array.isArray(parsed.profiles)) { db = parsed; return true; }
+      if (parsed && Array.isArray(parsed.profiles)) { db = parsed; normalizeDb(); return true; }
     }
   } catch (e) { console.error('remoteLoad failed', e); }
   return false;
@@ -82,6 +88,28 @@ function save() {
     } catch (e) { console.error('file save failed', e); }
   }, 100);
   remoteSave();
+}
+
+// ---------- Web Push (VAPID) ----------
+let webpush = null;
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+if (VAPID_PUBLIC && VAPID_PRIVATE) {
+  try {
+    webpush = require('web-push');
+    webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:kapio@muse.ai', VAPID_PUBLIC, VAPID_PRIVATE);
+  } catch (e) { console.error('web-push init failed', e); webpush = null; }
+}
+function sendPushToProfile(profileId, payload) {
+  if (!webpush) return;
+  for (const s of db.pushSubs.filter(x => x.profileId === profileId)) {
+    webpush.sendNotification(s.subscription, JSON.stringify(payload)).catch(err => {
+      if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+        db.pushSubs = db.pushSubs.filter(x => x.endpoint !== s.endpoint);
+        save();
+      }
+    });
+  }
 }
 const id = () => crypto.randomBytes(8).toString('hex');
 const now = () => new Date().toISOString();
@@ -179,6 +207,7 @@ function postMessage(roomId, senderId, senderName, body, type = 'text') {
     db.notifications.push(n);
     const unreadTotal = db.notifications.filter(x => x.profileId === m.profileId && !x.read).length;
     wsSend(m.profileId, { type: 'notification', notification: n, unreadTotal, roomId, unreadInRoom: unreadCount(roomId, m.profileId) });
+    sendPushToProfile(m.profileId, { title: room ? room.name : 'Muse対応チャット', body: `${senderName}: ${body.slice(0, 80)}`, roomId });
   }
   // Kapio queue
   if (room && room.kapioEnabled && senderId !== KAPIO_ID && type === 'text') {
@@ -351,6 +380,17 @@ app.post('/api/notifications/read-all', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// push subscriptions
+app.get('/api/push/public-key', (req, res) => res.json({ key: VAPID_PUBLIC || null }));
+app.post('/api/push/subscribe', auth, (req, res) => {
+  const sub = req.body && req.body.subscription;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: 'subscription required' });
+  db.pushSubs = db.pushSubs.filter(s => s.endpoint !== sub.endpoint);
+  db.pushSubs.push({ profileId: req.profile.id, endpoint: sub.endpoint, subscription: sub, createdAt: now() });
+  save();
+  res.json({ ok: true });
+});
+
 // ---------- bridge API (external Claude / Kapio) ----------
 app.get('/api/bridge/pending', bridgeAuth, (req, res) => {
   const pending = db.kapioRequests.filter(r => r.status === 'pending').map(r => {
@@ -397,6 +437,10 @@ app.post('/api/bridge/dismiss', bridgeAuth, (req, res) => {
   save();
   res.json({ ok: true });
 });
+
+// app icon (PNG, embedded so install icons work without extra files)
+const ICON_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAPo0lEQVR4nO3cUbLTNhiGYR+mA1uiC4FF0oXAlugNvWhTIOckcWzZ0q/vea47g2Qm+l8roS8LQ3n/9dOP3msAOMrff/710nsN/MtfxMkMeIDbBMJ5POgDGfYA+4mCY3ioDRn4AMcTBG14iDsY+AD9CYJtPLQnGfoA4xID63lQKxj6APWIgfs8nDsMfoD6hMDbPJQrhj7AvMTATx7Efwx+gBxCQAAY/ADBkkMgduMGPwAXiSEQt2GDH4BbkkIgZqMGPwBrJYTA9Bs0+AHYauYQmHZjBj8ArcwYAu96L+AIhj8ALc04V6Yqmhn/ggAYyyy3AVNswuAH4GzVQ6D8VwCGPwA9VJ8/pQOg+sMHoLbKc6jk9UXlBw7AnKp9JVDuBsDwB2BE1eZTqQCo9nAByFJpTpW4rqj0QAFgWcb/SmD4GwDDH4CKRp9fQwfA6A8PAO4ZeY4NGwAjPzQAWGvUeTZkAIz6sABgixHn2nABMOJDAoC9Rptvw/xCcbQHAwBHGeFfCAxxA2D4A5BkhLnXPQBGeAgAcLbe869rAPTePAD01HMOdgsAwx8A+s3D7l8BAADn6xIA3v4B4Kcec/H0ADD8AeC1s+fjqQFg+APAbWfOydMCwPAHgMfOmpenBIDhDwDrnTE3Dw8Awx8Annf0/PTPAAEg0KEB4O0fALY7co4eFgCGPwDsd9Q8PSQADH8AaOeIueo3AAAQqHkAePsHgPZaz9emAWD4A8BxWs7ZZgFg+APA8VrNW78BAIBATQLA2z8AnKfF3HUDAACBdgeAt38AON/e+bsrAAx/AOhnzxz2FQAABNocAN7+AaC/rfPYDQAABNoUAN7+AWAcW+ayGwAACPR0AHj7B4DxPDuf3QAAQKCnAsDbPwCM65k57QYAAAKtDgBv/wAwvrXz2g0AAARaFQDe/gGgjjVz2w0AAAR6GADe/gGgnkfz2w0AAAQSAAAQ6G4AuP4HgLruzXE3AAAQ6GYAePsHgPpuzXM3AAAQSAAAQKA3A8D1PwDM46257gYAAAIJAAAI9CoAXP8DwHyu57sbAAAIJAAAIJAAAIBA7/w/AAAgjxsAAAj0R+8FMJfvH7/0XgJM7cO3z72XwCRefAXAVoY9jEEUsIUA4CmGPoxNDLCWAGAVgx9qEQI8IgC4y+CH2oQAtwgA3mTww1yEANcEAL8x+GFuQoAL/x8A/mf4w/x8zrlwA4ADAUK5DcjmBiCc4Q+5fP6zCYBgPvyAcyCXAAjlQw9cOA8yCYBAPuzANedCHgEQxoccuMX5kEUABPHhBh5xTuQQACF8qIG1nBcZBEAAH2bgWc6N+QmAyfkQA1s5P+YmAAAgkACYmHoH9nKOzEsATMqHFmjFeTInAQAAgQTAhNQ60JpzZT4CAAACCYDJqHTgKM6XuQgAAAgkACaizoGjOWfmIQAAIJAAmIQqB87ivJmDAACAQAIAAAIJgAm4jgPO5typTwAAQCABAACBBAAABBIAABBIABTnhzhAL86f2gQAAAQSAAAQSAAAQCABAACBBAAABBIAABBIAABAIAEAAIEEAAAEEgAAEEgAAEAgAQAAgQQAAAQSAAAQSAAAQCABAACBBAAABBIAABBIAABAIAEAAIEEAAAEEgAAEEgAAEAgAQAAgQQAAAQSAAAQSAAAQCABAACBBAAABBIAABBIAABAIAEAAIEEAAAEEgAAEEgAFPfh2+feSwBCOX9qEwAAEEgAAEAgAQAAgQQAAAQSABPwQxzgbM6d+gQAAAQSAAAQSABMwnUccBbnzRwEAAAEEgATUeXA0Zwz8xAAABBIAExGnQNHcb7MRQAAQCABMCGVDrTmXJmPAACAQAJgUmodaMV5MicBMDEfWmAv58i8BAAABBIAk1PvwFbOj7kJgAA+xMCznBvzEwAhfJiBtZwXGQRAEB9q4BHnRA4BEMaHG7jF+ZBFAATyIQeuORfyCIBQPuzAhfMgkwAI5kMPOAdyCYBwPvyQy+c/28v7r59+9F4EY/j+8UvvJQAnMPhZFjcA/MKhAPPzOefCDQBvchsAczH4uSYAuEsIQG0GP7cIAFYRAlCLwc8jAoCnCAEYm8HPWgKAzcQAjMHQZwsBQFOiAI5l2NOKAGBosweFwxzoxf8HADox/IGeBAB0YPgDvQkAOJnhD4xAAMCJDH9gFAIATmL4AyMRAHACwx8YjQCAgxn+wIgEAAAEEgBwIG//wKgEABzE8AdGJgDgAIY/MDoBAI0Z/kAFAgAaMvyBKgQANGL4A5UIAGjA8AeqEQCwk+EPVCQAYAfDH6hKAABAIAEAG3n7ByoTALCB4Q9UJwDgSYY/MAMBAE8w/IFZCABYyfAHZiIAYAXDH5iNAIAHDH9gRgIA7jD8gVkJAAAIJADgBm//wMwEALzB8AdmJwDgiuEPJBAA8AvDH0ghAOA/hj+QRADAYvgDeQQA8Qx/IJEAIJrhD6QSAMQy/IFkAgAAAgkAInn7B9IJAOIY/gACgDCGP8C/BAAxDH+AnwQAEQx/gN8JAKZn+AO8JgCYmuEP8DYBwLQMf4DbBABTMvwB7hMAABBIADAdb/8AjwkApmL4A6wjAJiG4Q+wngBgCoY/wHMEAOUZ/gDPEwCUZvgDbCMAKMvwB9hOAFCS4Q+wjwCgHMMfYD8BAACBBAClePsHaEMAUIbhD9COAKAEwx+gLQHA8Ax/gPYEAEMz/AGOIQAAIJAAAIBAAgAAAgkAAAgkAAAgkAAAgEACAAACCQAACCQAACCQAACAQAIAAAIJAAAIJAAAIJAAAIBAAgAAAgkAAAgkAAAgkAAAgEACAAACCQAACCQAACCQAACAQAIAAAIJAAAIJAAAIJAAAIBAAgAAAgkAAAgkAAAgkAAAgEACAAACCQAACCQAACDQu7///Oul9yIAgHO5AQCAQAIAAAIJAAAIJAAAIJAAAIBAAgAAAgkAAAj0blmWxf8LAABy/P3nXy9uAAAgkAAAgEACAAACCQAACPR/APghIADM7zLv3QAAQCABAACBBAAABPotAPwOAADm9eucdwMAAIEEAAAEEgAAEOhVAPgdAADM53q+uwEAgEACAAACvRkAvgYAgHm8NdfdAABAIAEAAIFuBoCvAQCgvlvz3A0AAAS6GwBuAQCgrntz3A0AAAQSAAAQ6GEA+BoAAOp5NL/dAABAoFUB4BYAAOpYM7fdAABAoNUB4BYAAMa3dl67AQCAQE8FgFsAABjXM3PaDQAABHo6ANwCAMB4np3PbgAAINCmAHALAADj2DKX3QAAQKDNAeAWAAD62zqP3QAAQKBdAeAWAAD62TOHd98AiAAAON/e+esrAAAI1CQA3AIAwHlazF03AAAQqFkAuAUAgOO1mrdNbwBEAAAcp+Wcbf4VgAgAgPZaz1e/AQCAQIcEgFsAAGjniLl62A2ACACA/Y6ap4d+BSACAGC7I+eo3wAAQKDDA8AtAAA87+j5ecoNgAgAgPXOmJunfQUgAgDgsbPm5am/ARABAHDbmXPy9B8BigAAeO3s+djlXwGIAAD4qcdc9M8AASBQtwBwCwAA/eZh1xsAEQBAsp5zsPtXACIAgES951/3AFiW/g8BAM40wtzrvoBr779++tF7DQBwhBEG/8UQNwC/GunhAEAro8234QJgWcZ7SACwx4hzbcgAWJYxHxYAPGvUeTZsACzLuA8NANYYeY4NHQDLMvbDA4BbRp9fQy/umn8hAMDoRh/8F8PfAPyqykMFIFOlOVUqAJal1sMFIEe1+VRqsdd8JQBAb9UG/0W5G4BfVX3oAMyh8hwqHQDLUvvhA1BX9flTevHXfCUAwNGqD/6LKTZxTQgA0Nosg/+i/FcAb5ntLwmAvmacK9Nt6JrbAAC2mnHwX0y7sWtCAIC1Zh78F9Nv8JoQAOCWhMF/EbPRa0IAgIukwX8Rt+FrQgAgV+Lgv4jd+DUhAJAjefBfxD+Aa0IAYF4G/08exB1iAKA+Q/9tHsoKQgCgHoP/Pg/nSWIAYFyG/noe1A5iAKA/Q38bD60hQQBwPAO/DQ/xQIIAYD8D/xge6slEAcBthv15/gHxOi0PYD99BQAAAABJRU5ErkJggg==';
+app.get('/icon.png', (req, res) => { res.type('png').send(Buffer.from(ICON_PNG_B64, 'base64')); });
 
 // ---------- static / SPA ----------
 app.use(express.static(path.join(ROOT, 'public'), { maxAge: '1h' }));
