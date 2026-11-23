@@ -158,10 +158,10 @@ function roomMembers(roomId) {
   return db.members.filter(m => m.roomId === roomId).map(m => {
     if (isSeatId(m.profileId)) {
       const room = db.rooms.find(r => r.id === roomId);
-      return { id: m.profileId, name: room ? seatName(room) : 'Muse', color: '#d4a017', isKapio: m.profileId === KAPIO_ID, isMuse: true };
+      return { id: m.profileId, name: room ? seatName(room) : 'Muse', color: '#d4a017', isKapio: m.profileId === KAPIO_ID, isMuse: true, lastReadSeq: null };
     }
     const p = db.profiles.find(x => x.id === m.profileId);
-    return p ? { id: p.id, name: p.name, color: p.color, isKapio: false, isMuse: false } : null;
+    return p ? { id: p.id, name: p.name, color: p.color, isKapio: false, isMuse: false, lastReadSeq: m.lastReadSeq || 0 } : null;
   }).filter(Boolean);
 }
 function unreadCount(roomId, profileId) {
@@ -172,10 +172,19 @@ function unreadCount(roomId, profileId) {
 }
 function markRoomRead(roomId, profileId) {
   const mem = memberOf(roomId, profileId);
-  if (!mem) return;
+  if (!mem) return 0;
   const msgs = db.messages.filter(m => m.roomId === roomId);
   mem.lastReadSeq = msgs.length ? (msgs[msgs.length - 1].seq || 0) : 0;
   for (const n of db.notifications) if (n.profileId === profileId && n.roomId === roomId) n.read = true;
+  return mem.lastReadSeq;
+}
+function broadcastRead(roomId, profileId) {
+  const mem = memberOf(roomId, profileId);
+  if (!mem) return;
+  broadcastRoom(roomId, { type: 'read', roomId, profileId, lastReadSeq: mem.lastReadSeq || 0 });
+}
+function validImage(v) {
+  return (typeof v === 'string' && v.startsWith('data:image/') && v.length <= 1600000) ? v : null;
 }
 function roomView(room, profileId) {
   const msgs = db.messages.filter(m => m.roomId === room.id);
@@ -184,7 +193,7 @@ function roomView(room, profileId) {
     id: room.id, name: room.name, inviteCode: room.inviteCode,
     kapioEnabled: room.kapioEnabled, kapioMode: room.kapioMode,
     members: roomMembers(room.id),
-    lastMessage: last ? { body: last.body, senderName: last.senderName, createdAt: last.createdAt } : null,
+    lastMessage: last ? { body: last.body || (last.image ? '画像を送信しました' : ''), senderName: last.senderName, createdAt: last.createdAt } : null,
     unread: profileId ? unreadCount(room.id, profileId) : 0,
     lastSummary: room.lastSummary || null,
     museSeat: seatInfo(room),
@@ -208,25 +217,26 @@ function broadcastRoom(roomId, obj, exceptProfileId) {
 }
 
 // ---------- core: post message ----------
-function postMessage(roomId, senderId, senderName, body, type = 'text') {
+function postMessage(roomId, senderId, senderName, body, type = 'text', image = null) {
   db.seq = (db.seq || 0) + 1;
-  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, createdAt: now() };
+  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, createdAt: now() };
   db.messages.push(msg);
   const room = db.rooms.find(r => r.id === roomId);
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
+  const preview = body ? body.slice(0, 80) : (image ? '画像を送信しました' : '');
   // notifications for other human members
   for (const m of db.members.filter(x => x.roomId === roomId)) {
     if (isSeatId(m.profileId) || m.profileId === senderId) continue;
     const n = {
       id: id(), profileId: m.profileId, roomId, messageId: msg.id,
-      preview: body.slice(0, 80), senderName, roomName: room ? room.name : '',
+      preview, senderName, roomName: room ? room.name : '',
       createdAt: msg.createdAt, read: false,
     };
     db.notifications.push(n);
     const unreadTotal = db.notifications.filter(x => x.profileId === m.profileId && !x.read).length;
     wsSend(m.profileId, { type: 'notification', notification: n, unreadTotal, roomId, unreadInRoom: unreadCount(roomId, m.profileId) });
-    sendPushToProfile(m.profileId, { title: room ? room.name : 'Muse対応チャット', body: `${senderName}: ${body.slice(0, 80)}`, roomId });
+    sendPushToProfile(m.profileId, { title: room ? room.name : 'Muse対応チャット', body: `${senderName}: ${preview}`, roomId });
   }
   // Muse seat queue: mention the seat's name, "Muse" or "ミューズ"
   if (room && room.kapioEnabled && !isSeatId(senderId) && senderId !== 'system' && type === 'text') {
@@ -247,12 +257,12 @@ function queueKapio(roomId, type, requestedBy, triggerMessageId) {
 }
 function roomContext(roomId, limit = 30) {
   return db.messages.filter(m => m.roomId === roomId).slice(-limit)
-    .map(m => ({ senderName: m.senderName, senderId: m.senderId, body: m.body, type: m.type, createdAt: m.createdAt }));
+    .map(m => ({ senderName: m.senderName, senderId: m.senderId, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, createdAt: m.createdAt }));
 }
 
 // ---------- Express ----------
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '4mb' }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true, name: 'muse-chat', time: now() }));
 
@@ -362,13 +372,15 @@ app.get('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
 });
 app.post('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 4000);
-  if (!body) return res.status(400).json({ error: 'body required' });
-  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body);
+  const image = validImage(req.body.image);
+  if (!body && !image) return res.status(400).json({ error: 'body required' });
+  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body, image && !body ? 'image' : 'text', image);
   res.json(msg);
 });
 app.post('/api/rooms/:id/read', auth, requireMember, (req, res) => {
   markRoomRead(req.room.id, req.profile.id);
   save();
+  broadcastRead(req.room.id, req.profile.id);
   res.json({ ok: true });
 });
 app.post('/api/rooms/:id/call-kapio', auth, requireMember, (req, res) => {
@@ -620,12 +632,14 @@ wss.on('connection', (ws, req) => {
     if (!room || !memberOf(room.id, profile.id)) return;
     if (data.type === 'send') {
       const body = String(data.body || '').trim().slice(0, 4000);
-      if (body) postMessage(room.id, profile.id, profile.name, body);
+      const image = validImage(data.image);
+      if (body || image) postMessage(room.id, profile.id, profile.name, body, image && !body ? 'image' : 'text', image);
     } else if (data.type === 'callKapio') {
       if (room.kapioEnabled) queueKapio(room.id, 'reply', profile.id, null);
     } else if (data.type === 'read') {
       markRoomRead(room.id, profile.id);
       save();
+      broadcastRead(room.id, profile.id);
     }
   });
   ws.on('close', () => {
