@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="stylesheet" href="/style.css?v=4.3">
+<link rel="stylesheet" href="/style.css?v=4.3.2">
 </head>
 <body>
 
@@ -59,7 +59,8 @@
     </div>
   </header>
   <div id="kapio-bar" class="kapio-bar hidden">
-    <span id="kapio-status"></span>
+    <button type="button" id="kapio-summary" class="kapio-summary"></button>
+    <div id="kapio-detail" class="kapio-detail hidden"><span id="kapio-status"></span></div>
     <button id="call-kapio-btn" class="sub-btn">Museを呼ぶ</button>
   </div>
   <div id="message-list" class="message-list"></div>
@@ -190,6 +191,6 @@
   </div>
 </div>
 
-<script src="/app.js?v=4.3.1"></script>
+<script src="/app.js?v=4.3.2"></script>
 </body>
 </html>
