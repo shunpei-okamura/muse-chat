@@ -617,6 +617,7 @@ $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
   catch (e) { alert(e.message); }
+});
 $('#summary-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   if (!currentRoom.kapioEnabled) { alert('このルームにはMuseが同席していません'); return; }
