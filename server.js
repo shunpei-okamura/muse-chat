@@ -39,7 +39,7 @@ const BRIDGE_TOKEN = ENV.BRIDGE_TOKEN;
 
 // ---------- settings ----------
 const UNSEND_WINDOW_MS = 24 * 60 * 60 * 1000;               // 送信取消できる期間
-const REQ_TTL_MS = Number(process.env.MUSE_REQUEST_TTL_MS) || 30 * 60 * 1000; // Muse依頼の有効期限
+const REQ_TTL_MS = Number(process.env.MUSE_REQUEST_TTL_MS) || 24 * 60 * 60 * 1000; // v4.8: Muse依頼の有効期限（全種別24時間に統一）
 const PICK_RETRY_MS = 5 * 60 * 1000;                          // 受け取り後この時間返信がなければ再配布
 const LIVE_WINDOW_MS = 60 * 1000;                             // 見張り役が接続中とみなす時間
 const POLLING_WINDOW_MS = 20 * 60 * 1000;                     // 巡回で拾ってくれる見込みの時間
@@ -543,7 +543,7 @@ function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null)
       return dup;
     }
   }
-  const ttlMs = type === 'group' ? 24 * 60 * 60 * 1000 : REQ_TTL_MS; // v4.4: group依頼は24時間保持
+  const ttlMs = REQ_TTL_MS; // v4.8: 種別を問わず24時間保持に統一
   const req = {
     id: id(), roomId, type, requestedBy, triggerMessageId: triggerMessageId || null, ownerId,
     status: 'pending', pickedAt: null, partialMessageId: null,
@@ -627,7 +627,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.7</strong></p>'
++ '<p>現在のバージョン: <strong>v4.8</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -645,7 +645,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -1008,6 +1008,20 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   if (!seat) return res.status(403).json({ error: 'no seat in this room' });
   const msg = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text');
   res.json({ ok: true, message_id: msg.id });
+});
+// v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
+app.get('/api/bridge/history', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+  const sinceMs = req.query.since ? Date.parse(String(req.query.since)) : 0; // since はISO時刻
+  let rooms = db.rooms.filter(r => req.bridge.kind === 'global' ? seatsOf(r).length > 0 : !!seatByOwner(r, req.bridge.profile.id));
+  if (req.query.room_id) rooms = rooms.filter(r => r.id === req.query.room_id);
+  if (req.query.room_name) rooms = rooms.filter(r => r.name === String(req.query.room_name));
+  if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
+  res.json({ ok: true, rooms: rooms.map(r => {
+    const all = db.messages.filter(m => m.roomId === r.id && m.type !== 'unsent' && (!sinceMs || Date.parse(m.createdAt) > sinceMs));
+    return { room_id: r.id, room_name: r.name, messages: all.slice(-limit).map(m => ({ id: m.id, sender_id: m.senderId, sender_name: m.senderName, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, reply_to: m.replyTo || null, created_at: m.createdAt })) };
+  }) });
 });
 // bridge admin (global bridge only)
 app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
