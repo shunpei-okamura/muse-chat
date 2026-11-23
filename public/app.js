@@ -7,24 +7,52 @@ const fmtTime = (iso) => {
   const hm = d.toLocaleTimeString('ja-JP', { hour: 'numeric', minute: '2-digit' });
   return d.toDateString() === n.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 };
+const UNSEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 let profile = null;
 try { profile = JSON.parse(localStorage.getItem('mc_profile') || 'null'); } catch { profile = null; }
 let ws = null;
+let wsConnecting = false;
 let currentRoom = null;
 let roomsCache = [];
 let pendingImage = null;
 let chatMessages = [];
+let pushActive = false;
 const joinMatch = location.pathname.match(/^\/join\/([A-Za-z0-9]+)/);
 let pendingJoinCode = joinMatch ? joinMatch[1].toUpperCase() : null;
+let pendingOpenRoom = new URLSearchParams(location.search).get('room');
 
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (profile) headers.Authorization = `Bearer ${profile.token}`;
-  const res = await fetch(path, { ...opts, headers });
+  let res;
+  try {
+    res = await fetch(path, { ...opts, headers });
+  } catch (e) {
+    const err = new Error('サーバーに接続できません');
+    err.status = 0;
+    throw err;
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+// ---------- connection banner ----------
+const connBanner = document.createElement('div');
+connBanner.className = 'conn-banner hidden';
+connBanner.textContent = 'サーバーに再接続しています…';
+document.body.appendChild(connBanner);
+let connBannerTimer = null;
+function setConnected(ok) {
+  clearTimeout(connBannerTimer);
+  if (ok) { connBanner.classList.add('hidden'); return; }
+  // 一瞬の切断では出さない
+  connBannerTimer = setTimeout(() => connBanner.classList.remove('hidden'), 4000);
 }
 
 // ---------- views ----------
@@ -65,6 +93,7 @@ async function subscribePush() {
     let sub = await reg.pushManager.getSubscription();
     if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
     await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub }) });
+    pushActive = true;
   } catch { /* push is best-effort */ }
 }
 
@@ -80,6 +109,12 @@ async function afterLogin() {
       openRoom(room.id);
       return;
     } catch { alert('招待リンクのルームが見つかりませんでした'); pendingJoinCode = null; history.replaceState(null, '', '/'); }
+  }
+  if (pendingOpenRoom) {
+    const rid = pendingOpenRoom;
+    pendingOpenRoom = null;
+    history.replaceState(null, '', '/');
+    try { await loadRooms(); await openRoom(rid); refreshBell(); return; } catch { /* fall through */ }
   }
   show('#view-rooms');
   loadRooms();
@@ -101,7 +136,7 @@ async function loadRooms() {
     li.innerHTML = `
       <div class="avatar" style="background:${esc(color)}">${esc(initial)}</div>
       <div class="room-meta">
-        <div class="room-name">${esc(r.name)}${r.kapioEnabled ? '<span title="カピお同席中">🍸</span>' : ''}</div>
+        <div class="room-name">${esc(r.name)}${r.kapioEnabled ? '<span title="Muse同席中">🍸</span>' : ''}</div>
         <div class="room-last">${r.lastMessage ? esc(r.lastMessage.senderName + ': ' + r.lastMessage.body) : 'まだメッセージがありません'}</div>
       </div>
       <div class="room-side">
@@ -135,60 +170,170 @@ async function joinByCode(code) {
   } catch { alert('その招待コードのルームは見つかりませんでした'); }
 }
 $('#join-code-btn').addEventListener('click', () => joinByCode($('#join-code-input').value));
-$('#me-btn').addEventListener('click', () => { $('#me-name').textContent = profile.name; openModal('#modal-me'); });
+$('#me-btn').addEventListener('click', async () => {
+  $('#me-name').textContent = profile.name;
+  try { const me = await api('/api/me'); $('#me-push-preview').checked = me.pushPreview !== false; } catch { /* ignore */ }
+  openModal('#modal-me');
+});
+$('#me-push-preview').addEventListener('change', async (e) => {
+  try { await api('/api/me/settings', { method: 'POST', body: JSON.stringify({ pushPreview: e.target.checked }) }); }
+  catch (err) { alert('保存できませんでした: ' + err.message); e.target.checked = !e.target.checked; }
+});
+
+// ---------- Muse presence + activity ----------
+const museActivity = document.createElement('div');
+museActivity.className = 'muse-activity hidden';
+$('#view-chat').insertBefore(museActivity, $('#image-preview'));
+let activeRequests = new Map(); // requestId -> { state, type }
+let activityHideTimer = null;
+
+const PRESENCE_LABEL = {
+  live: { dot: 'live', text: 'すぐ返信できます' },
+  polling: { dot: 'polling', text: '返信まで数分かかります' },
+  offline: { dot: 'offline', text: '今は返信が遅れるかもしれません' },
+};
+function renderMuseBar() {
+  if (!currentRoom) return;
+  const seat = currentRoom.museSeat || { active: currentRoom.kapioEnabled, name: 'Muse', presence: 'offline' };
+  $('#kapio-bar').classList.toggle('hidden', !seat.active);
+  if (!seat.active) return;
+  const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : `「${seat.name}」と呼ぶと返信`;
+  const p = PRESENCE_LABEL[seat.presence] || PRESENCE_LABEL.offline;
+  $('#kapio-status').innerHTML = `🍸 ${esc(seat.name)}（Muse）同席中・${esc(how)}<br><span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span>`;
+  $('#call-kapio-btn').textContent = `${seat.name}を呼ぶ`;
+}
+function renderMuseActivity() {
+  clearTimeout(activityHideTimer);
+  if (!currentRoom) { museActivity.classList.add('hidden'); return; }
+  const name = currentRoom.museSeat?.name || 'Muse';
+  const presence = currentRoom.museSeat?.presence || 'offline';
+  const states = [...activeRequests.values()];
+  if (!states.length) { museActivity.classList.add('hidden'); return; }
+  const thinking = states.find(s => s.state === 'thinking');
+  const called = states.find(s => s.state === 'called');
+  const expired = states.find(s => s.state === 'expired');
+  let text = '';
+  let busy = false;
+  if (thinking) {
+    text = thinking.type === 'summary' ? `${name}が要約を書いています` : `${name}が考え中`;
+    busy = true;
+  } else if (called) {
+    if (presence === 'live') { text = called.type === 'summary' ? `${name}に要約を頼みました` : `${name}を呼んでいます`; busy = true; }
+    else if (presence === 'polling') text = `${name}に届きました。返信まで数分かかります`;
+    else text = `${name}に届きました。今は返信が遅れるかもしれません`;
+  } else if (expired) {
+    text = `${name}は時間内に返信できませんでした`;
+    activityHideTimer = setTimeout(() => { for (const [k, v] of activeRequests) if (v.state === 'expired') activeRequests.delete(k); renderMuseActivity(); }, 8000);
+  }
+  museActivity.innerHTML = `<span>${esc(text)}</span>${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}`;
+  museActivity.classList.remove('hidden');
+}
+function handleMuseStatus(data) {
+  if (!currentRoom || data.roomId !== currentRoom.id) return;
+  if (data.presence && currentRoom.museSeat) { currentRoom.museSeat.presence = data.presence; renderMuseBar(); }
+  if (data.state === 'done') activeRequests.delete(data.requestId);
+  else activeRequests.set(data.requestId, { state: data.state, type: data.requestType });
+  renderMuseActivity();
+}
 
 // ---------- chat ----------
 async function openRoom(roomId) {
   const detail = await api(`/api/rooms/${roomId}`);
   currentRoom = detail;
   $('#chat-title').textContent = detail.name;
-  const seat = detail.museSeat || { active: detail.kapioEnabled, name: 'カピお' };
-  $('#kapio-bar').classList.toggle('hidden', !seat.active);
-  if (seat.active) {
-    $('#kapio-status').textContent = detail.kapioMode === 'auto' ? `🍸 ${seat.name}（Muse）同席中（自動で口を出します）` : `🍸 ${seat.name}（Muse）同席中（「${seat.name}」と呼ぶと返信）`;
-    $('#call-kapio-btn').textContent = `${seat.name}を呼ぶ`;
-  }
+  activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type }]));
+  renderMuseBar();
+  renderMuseActivity();
   const msgs = await api(`/api/rooms/${roomId}/messages`);
-  const list = $('#message-list');
-  list.innerHTML = '';
-  chatMessages = [];
+  renderAllMessages(msgs);
   clearPendingImage();
-  for (const m of msgs) appendMessage(m);
-  list.scrollTop = list.scrollHeight;
-  updateReadReceipts();
   show('#view-chat');
-  await api(`/api/rooms/${roomId}/read`, { method: 'POST' });
+  scrollChat();
+  if (document.visibilityState === 'visible') await api(`/api/rooms/${roomId}/read`, { method: 'POST' });
   refreshBell();
 }
-function appendMessage(m) {
-  const list = $('#message-list');
-  if (m.id && list.querySelector(`[data-msg-id="${m.id}"]`)) return;
-  if (m.type === 'system') {
+function renderAllMessages(msgs) {
+  $('#message-list').innerHTML = '';
+  chatMessages = [];
+  for (const m of msgs) appendMessage(m);
+  updateReadReceipts();
+}
+const lastSeq = () => chatMessages.reduce((a, m) => Math.max(a, m.seq || 0), 0);
+const findMsg = (msgId) => chatMessages.find(x => x.id === msgId);
+const isMuseSender = (m) => m.senderId === 'kapio' || String(m.senderId || '').startsWith('muse:');
+function canUnsend(m) {
+  if (!m || m.type === 'system' || m.type === 'unsent') return false;
+  const ownsLegacyKapio = m.senderId === 'kapio' && currentRoom?.createdBy === profile.id;
+  if (m.senderId !== profile.id && m.senderId !== `muse:${profile.id}` && !ownsLegacyKapio) return false;
+  return Date.now() - Date.parse(m.createdAt) <= UNSEND_WINDOW_MS;
+}
+function quoteHtml(m) {
+  if (!m.replyTo) return '';
+  const orig = findMsg(m.replyTo);
+  let text = '元のメッセージ';
+  if (orig) text = orig.type === 'unsent' ? '取り消されたメッセージ' : `${orig.senderName}: ${orig.body || (orig.image ? '画像' : '')}`;
+  return `<div class="msg-quote" data-jump="${esc(m.replyTo)}">${esc(text.slice(0, 40))}</div>`;
+}
+function renderMessage(m) {
+  if (m.type === 'system' || m.type === 'unsent') {
     const div = document.createElement('div');
     div.className = 'msg-system';
     if (m.id) div.dataset.msgId = m.id;
-    div.textContent = m.body;
-    list.appendChild(div);
-    return;
+    div.textContent = m.type === 'unsent' ? `${m.senderName}が送信を取り消しました` : m.body;
+    return div;
   }
-  chatMessages.push(m);
   const isMe = m.senderId === profile.id;
-  const isKapio = m.senderId === 'kapio' || String(m.senderId || '').startsWith('muse:');
+  const isKapio = isMuseSender(m);
   const member = currentRoom?.members.find(x => x.id === m.senderId);
   const row = document.createElement('div');
   row.className = 'msg-row' + (isMe ? ' me' : '') + (isKapio ? ' kapio' : '');
   if (m.id) row.dataset.msgId = m.id;
   row.innerHTML = `
-    ${isMe ? '' : `<div class="avatar" style="background:${esc(member?.color || '#888')}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
+    ${isMe ? '' : `<div class="avatar" style="background:${esc(isKapio ? '#d4a017' : (member?.color || '#888'))}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（Muse）' : ''}</div>`}
-      <div class="msg-bubble">${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${esc(m.body)}</span>` : ''}</div>
-      <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}</span></div>
+      <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${esc(m.body)}</span>` : ''}</div>
+      <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
   const img = row.querySelector('.msg-image');
   if (img) img.addEventListener('click', () => { $('#lightbox-img').src = m.image; $('#lightbox').classList.remove('hidden'); });
-  list.appendChild(row);
-  if (isMe) updateReadReceipts();
+  const quote = row.querySelector('.msg-quote');
+  if (quote) quote.addEventListener('click', () => jumpTo(m.replyTo));
+  attachLongPress(row.querySelector('.msg-bubble'), m.id);
+  return row;
+}
+function appendMessage(m) {
+  const list = $('#message-list');
+  if (m.id && list.querySelector(`[data-msg-id="${CSS.escape(m.id)}"]`)) return;
+  if (m.deleted) return;
+  chatMessages.push(m);
+  list.appendChild(renderMessage(m));
+  if (m.senderId === profile.id) updateReadReceipts();
+}
+function replaceMessage(m) {
+  const list = $('#message-list');
+  const old = list.querySelector(`[data-msg-id="${CSS.escape(m.id)}"]`);
+  const idx = chatMessages.findIndex(x => x.id === m.id);
+  if (m.deleted) {
+    if (old) old.remove();
+    if (idx >= 0) chatMessages.splice(idx, 1);
+    return;
+  }
+  if (idx >= 0) chatMessages[idx] = m;
+  if (old) old.replaceWith(renderMessage(m));
+  // この発言を引用しているリプライも描き直す
+  for (const r of chatMessages.filter(x => x.replyTo === m.id)) {
+    const el = list.querySelector(`[data-msg-id="${CSS.escape(r.id)}"]`);
+    if (el) el.replaceWith(renderMessage(r));
+  }
+  updateReadReceipts();
+}
+function jumpTo(msgId) {
+  const el = $('#message-list').querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
+  if (!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1200);
 }
 function updateReadReceipts() {
   if (!currentRoom || !profile) return;
@@ -203,7 +348,81 @@ function updateReadReceipts() {
   }
 }
 function scrollChat() { const l = $('#message-list'); l.scrollTop = l.scrollHeight; }
+// 切断中に届いた分を取りに行く
+async function syncMissed() {
+  if (!currentRoom || $('#view-chat').classList.contains('hidden')) return;
+  try {
+    const roomId = currentRoom.id;
+    const [msgs, detail] = await Promise.all([
+      api(`/api/rooms/${roomId}/messages?after=${lastSeq()}`),
+      api(`/api/rooms/${roomId}`),
+    ]);
+    if (!currentRoom || currentRoom.id !== roomId) return;
+    currentRoom = detail;
+    activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type }]));
+    renderMuseBar();
+    renderMuseActivity();
+    for (const m of msgs) appendMessage(m);
+    updateReadReceipts();
+    if (msgs.length) scrollChat();
+    if (document.visibilityState === 'visible') api(`/api/rooms/${roomId}/read`, { method: 'POST' }).catch(() => {});
+  } catch { /* retry on next reconnect */ }
+}
 
+// ---------- long press menu (copy / unsend) ----------
+const sheet = document.createElement('div');
+sheet.className = 'sheet hidden';
+sheet.innerHTML = `<div class="sheet-card">
+  <button data-act="copy">コピー</button>
+  <button data-act="unsend" class="danger">送信取消</button>
+  <button data-act="cancel">キャンセル</button>
+</div>`;
+document.body.appendChild(sheet);
+let sheetMsgId = null;
+function openSheet(msgId) {
+  const m = findMsg(msgId);
+  if (!m) return;
+  sheetMsgId = msgId;
+  sheet.querySelector('[data-act="copy"]').classList.toggle('hidden', !m.body);
+  sheet.querySelector('[data-act="unsend"]').classList.toggle('hidden', !canUnsend(m));
+  if (!m.body && !canUnsend(m)) return;
+  sheet.classList.remove('hidden');
+}
+function closeSheet() { sheet.classList.add('hidden'); sheetMsgId = null; }
+sheet.addEventListener('click', async (e) => {
+  const act = e.target.dataset && e.target.dataset.act;
+  if (e.target === sheet || act === 'cancel') { closeSheet(); return; }
+  const m = findMsg(sheetMsgId);
+  closeSheet();
+  if (!m) return;
+  if (act === 'copy') {
+    try { await navigator.clipboard.writeText(m.body); } catch { /* ignore */ }
+  } else if (act === 'unsend') {
+    const museHere = !!currentRoom?.museSeat?.active;
+    const note = museHere ? '\nMuseがすでに読んでいた場合、Muse側の記憶からは消せません。' : '';
+    if (!confirm(`送信を取り消しますか？\n全員の画面から消えます。${note}`)) return;
+    try {
+      const updated = await api(`/api/messages/${m.id}/unsend`, { method: 'POST', body: '{}' });
+      replaceMessage(updated);
+    } catch (err) { alert(err.message); }
+  }
+});
+function attachLongPress(el, msgId) {
+  if (!el) return;
+  let timer = null, sx = 0, sy = 0;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  el.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    sx = e.clientX; sy = e.clientY;
+    timer = setTimeout(() => { timer = null; if (navigator.vibrate) navigator.vibrate(10); openSheet(msgId); }, 450);
+  });
+  el.addEventListener('pointermove', (e) => { if (timer && (Math.abs(e.clientX - sx) > 10 || Math.abs(e.clientY - sy) > 10)) cancel(); });
+  el.addEventListener('pointerup', cancel);
+  el.addEventListener('pointercancel', cancel);
+  el.addEventListener('contextmenu', (e) => { e.preventDefault(); cancel(); openSheet(msgId); });
+}
+
+// ---------- send ----------
 function sendCurrent() {
   const ta = $('#composer-input');
   const body = ta.value.trim();
@@ -222,7 +441,8 @@ function sendCurrent() {
     ws.send(JSON.stringify({ type: 'send', roomId: currentRoom.id, body }));
   } else {
     api(`/api/rooms/${currentRoom.id}/messages`, { method: 'POST', body: JSON.stringify({ body }) })
-      .then(m => { appendMessage(m); scrollChat(); });
+      .then(m => { appendMessage(m); scrollChat(); })
+      .catch(e => { ta.value = body; alert('送信できませんでした: ' + e.message); });
   }
 }
 
@@ -272,21 +492,17 @@ $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
 });
 $('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; });
-$('#back-btn').addEventListener('click', () => { currentRoom = null; show('#view-rooms'); loadRooms(); });
+$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); renderMuseActivity(); show('#view-rooms'); loadRooms(); });
 $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
-  try {
-    await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' });
-    alert(`${currentRoom.museSeat?.name || 'Muse'}を呼びました。少し待つと返信が来ます。`);
-  } catch (e) { alert(e.message); }
+  try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
+  catch (e) { alert(e.message); }
 });
 $('#summary-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   if (!currentRoom.kapioEnabled) { alert('このルームにはMuseが同席していません'); return; }
-  try {
-    await api(`/api/rooms/${currentRoom.id}/summary-request`, { method: 'POST' });
-    alert('Museに要約を頼みました。できたらこのルームに投稿されます。');
-  } catch (e) { alert(e.message); }
+  try { await api(`/api/rooms/${currentRoom.id}/summary-request`, { method: 'POST' }); }
+  catch (e) { alert(e.message); }
 });
 
 // ---------- room settings ----------
@@ -311,7 +527,7 @@ $('#room-settings-btn').addEventListener('click', async () => {
     try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; } catch { /* ignore */ }
   }
   $('#settings-kapio-mode').value = detail.kapioMode;
-  $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとカピおが作ります。';
+  $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。';
   renderDecisions(detail.decisions || []);
   openModal('#modal-settings');
 });
@@ -334,7 +550,7 @@ function renderDecisions(decisions) {
 $('#decision-add-btn').addEventListener('click', async () => {
   const text = $('#decision-input').value.trim();
   if (!text || !currentRoom) return;
-  const d = await api(`/api/rooms/${currentRoom.id}/decisions`, { method: 'POST', body: JSON.stringify({ text }) });
+  await api(`/api/rooms/${currentRoom.id}/decisions`, { method: 'POST', body: JSON.stringify({ text }) });
   $('#decision-input').value = '';
   const detail = await api(`/api/rooms/${currentRoom.id}`);
   renderDecisions(detail.decisions || []);
@@ -345,6 +561,16 @@ $('#copy-link-btn').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(input.value); alert('招待リンクをコピーしました'); }
   catch { document.execCommand('copy'); alert('招待リンクをコピーしました'); }
 });
+async function reloadCurrentRoom() {
+  if (!currentRoom) return;
+  const detail = await api(`/api/rooms/${currentRoom.id}`);
+  currentRoom = detail;
+  $('#chat-title').textContent = detail.name;
+  renderMuseBar();
+  const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
+  renderAllMessages(msgs);
+  scrollChat();
+}
 $('#muse-claim-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   const name = $('#muse-name-input').value.trim();
@@ -352,12 +578,7 @@ $('#muse-claim-btn').addEventListener('click', async () => {
     await api(`/api/rooms/${currentRoom.id}/muse-claim`, { method: 'POST', body: JSON.stringify({ name }) });
     alert('あなたのMuseが同席するようになりました。設定に表示される連携トークンを、あなたのClaude（Muse）に渡してください。');
     $('#room-settings-btn').click();
-    const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
-    const list = $('#message-list');
-    list.innerHTML = '';
-    chatMessages = [];
-    for (const m of msgs) appendMessage(m);
-    scrollChat();
+    reloadCurrentRoom();
   } catch (e) { alert(e.message); }
 });
 $('#muse-release-btn').addEventListener('click', async () => {
@@ -365,6 +586,7 @@ $('#muse-release-btn').addEventListener('click', async () => {
   try {
     await api(`/api/rooms/${currentRoom.id}/muse-release`, { method: 'POST', body: '{}' });
     $('#room-settings-btn').click();
+    reloadCurrentRoom();
   } catch (e) { alert(e.message); }
 });
 $('#muse-token-copy').addEventListener('click', async () => {
@@ -375,20 +597,14 @@ $('#muse-token-copy').addEventListener('click', async () => {
 });
 $('#settings-save').addEventListener('click', async (e) => {
   if (!currentRoom) return;
-  const updated = await api(`/api/rooms/${currentRoom.id}/settings`, {
-    method: 'POST',
-    body: JSON.stringify({ name: $('#settings-name').value.trim(), kapioMode: $('#settings-kapio-mode').value }),
-  });
-  currentRoom = { ...currentRoom, ...updated };
-  $('#chat-title').textContent = updated.name;
-  $('#kapio-bar').classList.toggle('hidden', !updated.kapioEnabled);
-  closeModal(e.target);
-  const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
-  const list = $('#message-list');
-  list.innerHTML = '';
-  chatMessages = [];
-  for (const m of msgs) appendMessage(m);
-  scrollChat();
+  try {
+    await api(`/api/rooms/${currentRoom.id}/settings`, {
+      method: 'POST',
+      body: JSON.stringify({ name: $('#settings-name').value.trim(), kapioMode: $('#settings-kapio-mode').value }),
+    });
+    closeModal(e.target);
+    reloadCurrentRoom();
+  } catch (err) { alert('保存できませんでした: ' + err.message); }
 });
 
 // ---------- notifications ----------
@@ -430,39 +646,97 @@ $('#enable-notif-btn').addEventListener('click', async () => {
 
 // ---------- WebSocket ----------
 function connectWs() {
-  if (!profile) return;
+  if (!profile || wsConnecting || (ws && ws.readyState <= 1)) return;
+  wsConnecting = true;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(profile.token)}`);
-  ws.onmessage = (ev) => {
+  const sock = new WebSocket(`${proto}//${location.host}/ws?token=${encodeURIComponent(profile.token)}`);
+  ws = sock;
+  sock.onopen = () => {
+    wsConnecting = false;
+    setConnected(true);
+    syncMissed();
+    if (!$('#view-rooms').classList.contains('hidden')) loadRooms().catch(() => {});
+    refreshBell();
+  };
+  sock.onmessage = (ev) => {
     let data;
     try { data = JSON.parse(ev.data); } catch { return; }
+    const inThisRoom = currentRoom && data.roomId === currentRoom.id && !$('#view-chat').classList.contains('hidden');
     if (data.type === 'message') {
-      if (currentRoom && data.roomId === currentRoom.id && !$('#view-chat').classList.contains('hidden')) {
+      if (inThisRoom) {
         appendMessage(data.message);
         scrollChat();
-        api(`/api/rooms/${data.roomId}/read`, { method: 'POST' }).catch(() => {});
+        if (isMuseSender(data.message)) { for (const [k, v] of activeRequests) if (v.state !== 'expired') activeRequests.delete(k); renderMuseActivity(); }
+        // 画面を見ていない間は既読にしない
+        if (document.visibilityState === 'visible') api(`/api/rooms/${data.roomId}/read`, { method: 'POST' }).catch(() => {});
       } else if (!$('#view-rooms').classList.contains('hidden')) {
-        loadRooms();
+        loadRooms().catch(() => {});
       }
       refreshBell();
+    } else if (data.type === 'message_updated') {
+      if (inThisRoom) replaceMessage(data.message);
+      else if (!$('#view-rooms').classList.contains('hidden')) loadRooms().catch(() => {});
     } else if (data.type === 'read') {
       if (currentRoom && data.roomId === currentRoom.id) {
         const mem = (currentRoom.members || []).find(x => x.id === data.profileId);
         if (mem) mem.lastReadSeq = data.lastReadSeq;
         updateReadReceipts();
       }
+    } else if (data.type === 'muse_status') {
+      handleMuseStatus(data);
+    } else if (data.type === 'muse_presence') {
+      if (currentRoom && data.roomId === currentRoom.id && currentRoom.museSeat) {
+        currentRoom.museSeat.presence = data.presence;
+        renderMuseBar();
+        renderMuseActivity();
+      }
     } else if (data.type === 'notification') {
       refreshBell();
-      const viewing = currentRoom && data.roomId === currentRoom.id && !$('#view-chat').classList.contains('hidden');
-      if (!viewing && 'Notification' in window && Notification.permission === 'granted') {
+      // プッシュ通知が有効なら、二重に出さない
+      if (!inThisRoom && !pushActive && document.visibilityState === 'visible' && 'Notification' in window && Notification.permission === 'granted') {
         try { new Notification(data.notification.roomName, { body: `${data.notification.senderName}: ${data.notification.preview}`, icon: '/icon.svg' }); } catch { /* ignore */ }
       }
     }
   };
-  ws.onclose = () => { setTimeout(() => { if (profile) connectWs(); }, 3000); };
+  sock.onclose = () => {
+    wsConnecting = false;
+    if (ws === sock) ws = null;
+    setConnected(false);
+    setTimeout(() => { if (profile) connectWs(); }, 3000);
+  };
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !profile) return;
+  if (!ws || ws.readyState > 1) connectWs();
+  else syncMissed();
+});
+
+// 通知タップ（Service Workerから）
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'open-room' && e.data.roomId && profile) openRoom(e.data.roomId).catch(() => {});
+  });
 }
 
 // ---------- init ----------
+async function boot() {
+  try {
+    await api('/api/me');
+    setConnected(true);
+    afterLogin();
+  } catch (e) {
+    if (e.status === 401) {
+      // トークンが本当に無効なときだけ作り直す（通信エラーでは消さない）
+      profile = null;
+      localStorage.removeItem('mc_profile');
+      show('#view-setup');
+      return;
+    }
+    show('#view-rooms');
+    setConnected(false);
+    setTimeout(boot, 5000);
+  }
+}
 (async function init() {
   if ('serviceWorker' in navigator) { try { await navigator.serviceWorker.register('/sw.js'); } catch { /* ignore */ } }
   if (pendingJoinCode && !profile) {
@@ -473,10 +747,6 @@ function connectWs() {
       n.classList.remove('hidden');
     } catch { /* ignore */ }
   }
-  if (profile) {
-    // validate token
-    try { await api('/api/me'); afterLogin(); return; }
-    catch { profile = null; localStorage.removeItem('mc_profile'); }
-  }
+  if (profile) { boot(); return; }
   show('#view-setup');
 })();
