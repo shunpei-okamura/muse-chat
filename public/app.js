@@ -212,13 +212,13 @@ function renderMuseBar() {
   $('#kapio-bar').classList.toggle('hidden', !seats.length);
   if (!seats.length) return;
   const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : '名前を呼ばれたときだけ返信';
-  const names = seats.map(s => s.name).join('・');
+  const names = seats.map(s => s.ownerName ? `${s.name}（${s.ownerName}）` : s.name).join('・');
   const agg = seats.some(s => s.presence === 'live') ? PRESENCE_LABEL.live : (seats.some(s => s.presence === 'polling') ? PRESENCE_LABEL.polling : PRESENCE_LABEL.offline);
-  $('#kapio-summary').innerHTML = `<span>🍸 ${esc(names)}（Muse）同席中 <i class="dot ${agg.dot}"></i></span><span class="kapio-chevron">${kapioBarOpen ? '▾' : '▸'}</span>`;
+  $('#kapio-summary').innerHTML = `<span>🍸 ${esc(names)} 同席中 <i class="dot ${agg.dot}"></i></span><span class="kapio-chevron">${kapioBarOpen ? '▾' : '▸'}</span>`;
   $('#kapio-detail').classList.toggle('hidden', !kapioBarOpen);
   $('#kapio-status').innerHTML = seats.map(s => {
     const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
-    return `<span class="seat-line">🍸 ${esc(s.name)}（Muse）同席中<span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></span>`;
+    return `<span class="seat-line">🍸 ${esc(s.name)}${s.ownerName ? `（${esc(s.ownerName)}）` : '（Muse）'}同席中<span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></span>`;
   }).join('') + `<span class="seat-how">${esc(how)}</span>`;
   const old = $('#call-kapio-btn');
   if (old) old.classList.add('hidden');
@@ -321,13 +321,14 @@ function renderMessage(m) {
   const isMe = m.senderId === profile.id;
   const isKapio = isMuseSender(m);
   const member = currentRoom?.members.find(x => x.id === m.senderId);
+  const seatOwner = isKapio ? ((currentRoom?.muses || []).find(s => s.seatId === m.senderId)?.ownerName || null) : null;
   const row = document.createElement('div');
   row.className = 'msg-row' + (isMe ? ' me' : '') + (isKapio ? ' kapio' : '');
   if (m.id) row.dataset.msgId = m.id;
   row.innerHTML = `
     ${isMe ? '' : `<div class="avatar" style="background:${esc(isKapio ? '#d4a017' : (member?.color || '#888'))}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
-      ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（Muse）' : ''}</div>`}
+      ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? `（${esc(seatOwner || 'Muse')}）` : ''}</div>`}
       <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
       <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
@@ -654,15 +655,15 @@ $('#room-settings-btn').addEventListener('click', async () => {
   const memberNames = detail.members.map(m => {
     if (!m.isMuse) return m.name;
     const seat = seats.find(s => s.seatId === m.id);
-    return seat && seat.ownerName ? `${m.name}（${seat.ownerName}さんのMuse）` : `${m.name}（Muse）`;
+    return seat && seat.ownerName ? `${m.name}（${seat.ownerName}）` : `${m.name}（Muse）`;
   });
   for (const s of seats) {
-    if (!detail.members.some(m => m.id === s.seatId)) memberNames.push(s.ownerName ? `${s.name}（${s.ownerName}さんのMuse）` : `${s.name}（Muse）`);
+    if (!detail.members.some(m => m.id === s.seatId)) memberNames.push(s.ownerName ? `${s.name}（${s.ownerName}）` : `${s.name}（Muse）`);
   }
   $('#settings-members').textContent = memberNames.join('、');
   $('#muse-seat-status').textContent = !seats.length
     ? 'Museは同席していません'
-    : seats.map(s => s.ownerId ? `${s.name}（${s.ownerName || ''}さんのMuse）` : s.name).join('、') + ' が同席中です';
+    : seats.map(s => s.ownerName ? `${s.name}（${s.ownerName}）` : s.name).join('、') + ' が同席中です';
   const mine = seats.find(s => s.ownerId === profile.id);
   $('#muse-mine-area').classList.toggle('hidden', !mine);
   $('#muse-claim-area').classList.toggle('hidden', !!mine);
@@ -672,6 +673,7 @@ $('#room-settings-btn').addEventListener('click', async () => {
   $('#settings-kapio-mode').value = detail.kapioMode;
   $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。';
   renderDecisions(detail.decisions || []);
+  renderTasks(detail.tasks || []);
   openModal('#modal-settings');
 });
 function renderDecisions(decisions) {
@@ -690,6 +692,37 @@ function renderDecisions(decisions) {
     ul.appendChild(li);
   }
 }
+function renderTasks(tasks) {
+  const ul = $('#task-list');
+  ul.innerHTML = '';
+  for (const t of tasks.filter(x => !x.done)) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${esc(t.text)}</span>`;
+    const done = document.createElement('button');
+    done.textContent = '完了';
+    done.addEventListener('click', async () => {
+      await api(`/api/rooms/${currentRoom.id}/tasks/${t.id}/done`, { method: 'POST', body: '{}' });
+      li.remove();
+    });
+    li.appendChild(done);
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.addEventListener('click', async () => {
+      await api(`/api/rooms/${currentRoom.id}/tasks/${t.id}`, { method: 'DELETE' });
+      li.remove();
+    });
+    li.appendChild(del);
+    ul.appendChild(li);
+  }
+}
+$('#task-add-btn').addEventListener('click', async () => {
+  const text = $('#task-input').value.trim();
+  if (!text || !currentRoom) return;
+  await api(`/api/rooms/${currentRoom.id}/tasks`, { method: 'POST', body: JSON.stringify({ text }) });
+  $('#task-input').value = '';
+  const detail = await api(`/api/rooms/${currentRoom.id}`);
+  renderTasks(detail.tasks || []);
+});
 $('#decision-add-btn').addEventListener('click', async () => {
   const text = $('#decision-input').value.trim();
   if (!text || !currentRoom) return;
