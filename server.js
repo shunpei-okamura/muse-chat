@@ -434,7 +434,7 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   db.seq = (db.seq || 0) + 1;
   let replyTo = null;
   if (extra.replyTo && db.messages.some(m => m.id === extra.replyTo && m.roomId === roomId)) replyTo = extra.replyTo;
-  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, replyTo, createdAt: now() };
+  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, replyTo, via: extra.via || null, createdAt: now() };
   db.messages.push(msg);
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
@@ -457,14 +457,16 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   // Muse席への依頼（v4.3: 呼ばれた席ごとに1件ずつ）
   // v4.7: Muse席の発言でも、名指し（席名・メンバー名）または全体宛（みんな・全員・相談らしい疑問形）なら依頼を作る。
   //       人間の発言は従来どおり全て対象。Muse同士の連鎖防止として、人間を挟まずMuse席の発言が4件続いていたら止める。
+  // v4.8: 自発投稿（via:'post'）は人間の発言と同じ扱いで連鎖をリセットし、ブロック対象にもしない（代理人モデルでは人間の直接投稿がないため）
   if (room && room.kapioEnabled && senderId !== 'system' && type === 'text') {
     const fromSeat = isSeatId(senderId);
+    const viaPost = msg.via === 'post';
     let seatChain = 0;
-    if (fromSeat) {
+    if (fromSeat && !viaPost) {
       const prev = db.messages.filter(m => m.roomId === roomId && m.id !== msg.id && m.type === 'text');
-      for (let i = prev.length - 1; i >= 0; i--) { if (isSeatId(prev[i].senderId)) seatChain++; else break; }
+      for (let i = prev.length - 1; i >= 0; i--) { if (isSeatId(prev[i].senderId) && prev[i].via !== 'post') seatChain++; else break; }
     }
-    if (!fromSeat || seatChain < 4) {
+    if (!fromSeat || viaPost || seatChain < 4) {
       const named = namedSeatTargets(room, body, senderId).filter(s => seatIdOf(s) !== senderId);
       const group = isGroupQuestion(body) || /(みんな|全員|みなさん|皆さん)/.test(body || '');
       let targets = [], reqType = 'reply';
@@ -645,7 +647,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -969,7 +971,7 @@ app.post('/api/bridge/reply', bridgeAuth, (req, res) => {
     updateMessage(earlier);
     message = earlier;
   } else if (body) {
-    message = postMessage(room.id, senderId, senderName, body, 'text', null, { replyTo: r.triggerMessageId });
+    message = postMessage(room.id, senderId, senderName, body, 'text', null, { replyTo: r.triggerMessageId, via: 'reply' });
   }
   if (partial) {
     if (message) r.partialMessageId = message.id;
@@ -1006,7 +1008,7 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   if (req.bridge.kind === 'global') seat = seatsOf(room).find(s => !s.ownerId) || null;
   else seat = seatByOwner(room, req.bridge.profile.id);
   if (!seat) return res.status(403).json({ error: 'no seat in this room' });
-  const msg = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text');
+  const msg = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text', null, { via: 'post' });
   res.json({ ok: true, message_id: msg.id });
 });
 // v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
