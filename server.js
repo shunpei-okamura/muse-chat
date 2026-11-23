@@ -577,6 +577,7 @@ function wakeWaiters(req) {
     if (!w.res.headersSent) w.res.json({ pending });
     if (pending.length) return;
   }
+  
 }
 function finishRequest(r, state = 'done') {
   r.status = state === 'expired' ? 'expired' : 'done';
@@ -600,6 +601,37 @@ app.get('/api/health', (req, res) => res.json({
   storage: USE_REMOTE ? 'upstash' : 'file',
   lastSaveOkAt: persist.lastOkAt, saveFailures: persist.failures, lastSaveError: persist.lastError,
 }));
+// v4.6: 開発ページと自前ソースの公開（公開リポジトリと同じ内容。みんなでデバッグ・改善するため）
+const SOURCE_FILES = { 'server.js': 'server.js', 'package.json': 'package.json', 'app.js': 'public/app.js', 'index.html': 'public/index.html', 'style.css': 'public/style.css', 'sw.js': 'public/sw.js', 'manifest.json': 'public/manifest.json' };
+app.get('/source/:name', (req, res) => {
+  const rel = SOURCE_FILES[req.params.name];
+  if (!rel) return res.status(404).type('text/plain; charset=utf-8').send('not found');
+  try { res.type('text/plain; charset=utf-8').send(fs.readFileSync(path.join(ROOT, rel), 'utf8')); }
+  catch (e) { res.status(404).type('text/plain; charset=utf-8').send('not found'); }
+});
+const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
++ '<h1>Muse対応チャット 開発ページ</h1>'
++ '<p>現在のバージョン: <strong>v4.6</strong></p>'
++ '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
++ '<h2>コードの場所</h2>'
++ '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
++ '<table><tr><th>ファイル</th><th>GitHubで開く</th><th>そのまま読む</th></tr>'
++ '<tr><td>server.js（サーバー本体）</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/server.js">開く</a></td><td><a href="/source/server.js">/source/server.js</a></td></tr>'
++ '<tr><td>app.js（画面の動き）</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/public/app.js">開く</a></td><td><a href="/source/app.js">/source/app.js</a></td></tr>'
++ '<tr><td>index.html（画面の土台）</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/public/index.html">開く</a></td><td><a href="/source/index.html">/source/index.html</a></td></tr>'
++ '<tr><td>style.css（見た目）</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/public/style.css">開く</a></td><td><a href="/source/style.css">/source/style.css</a></td></tr>'
++ '<tr><td>sw.js（通知・キャッシュ）</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/public/sw.js">開く</a></td><td><a href="/source/sw.js">/source/sw.js</a></td></tr>'
++ '<tr><td>manifest.json</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/public/manifest.json">開く</a></td><td><a href="/source/manifest.json">/source/manifest.json</a></td></tr>'
++ '<tr><td>package.json</td><td><a href="https://github.com/shunpei-okamura/muse-chat/blob/main/package.json">開く</a></td><td><a href="/source/package.json">/source/package.json</a></td></tr>'
++ '</table>'
++ '<h2>変更の手順</h2>'
++ '<ol><li>GitHub の Webエディタでファイルを編集して、main へコミットする</li><li>Render の Manual Deploy はオーナー（しゅんぺい）のアカウントで実行するので、コミットしたら しゅんぺい（またはカピお）に知らせる</li><li>反映の確認は <a href="/api/health">/api/health</a> と公開URLで行う</li></ol>'
++ '<h2>Muse への案内</h2>'
++ '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
++ '<h2>変更履歴（抜粋）</h2>'
++ '<ul><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '</body></html>';
+app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
 function auth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.headers['x-profile-token'];
