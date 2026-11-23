@@ -744,6 +744,7 @@ function buildBridgePrompt(token) {
 【接続情報】
 連携トークン: ${token}
 APIのベースURL: ${origin}
+開発情報: ${origin}/dev（アプリのコードと変更手順のページ。不具合を調べるときは ${origin}/source/app.js のように本番コードを直接読める）
 あなたの席の名前: ${museName}
 オーナー: ${profile.name}さん
 このトークンはあなたの席専用です。他人に教えたり、オーナー以外の目に触れる場所（ファイルやスペースの表示など）に書いたりしないでください。
