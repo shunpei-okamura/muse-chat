@@ -446,6 +446,7 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   db.messages.push(msg);
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
+  emitBridgeEvent(roomId, { type: 'message', room_id: roomId, message: { id: msg.id, sender_id: msg.senderId, sender_name: msg.senderName, type: msg.type, body: msg.body || '', created_at: msg.createdAt } });
 
   if (type !== 'system') {
     const preview = previewOf(msg);
@@ -542,6 +543,24 @@ function museStatus(r, state) {
     presence: bridgePresence(r.ownerId || 'global'),
   });
 }
+// v4.14: ブリッジ用イベントストリーム（SSE）の配信基盤。見張りがポーリングなしで新着を検知できるようにする
+let bridgeEventSeq = 0;
+const bridgeEventBuffer = []; // 直近のイベント（再接続時の Last-Event-ID 再生用）{ id, roomId, ownerId, payload }
+const bridgeEventClients = new Set(); // { caller, res }
+function callerSeesRoom(caller, roomId) {
+  const room = roomById(roomId);
+  if (!room) return false;
+  return seatsOf(room).some(s => (caller.kind === 'global' ? !s.ownerId : s.ownerId === caller.profile.id));
+}
+function emitBridgeEvent(roomId, payload, ownerId = null) {
+  const ev = { id: ++bridgeEventSeq, roomId, ownerId, payload };
+  bridgeEventBuffer.push(ev);
+  if (bridgeEventBuffer.length > 300) bridgeEventBuffer.splice(0, bridgeEventBuffer.length - 300);
+  for (const c of [...bridgeEventClients]) {
+    const visible = payload.type === 'request' ? bridgeSees(c.caller, { ownerId }) : callerSeesRoom(c.caller, roomId);
+    if (visible) { try { c.res.write(`id: ${ev.id}\ndata: ${JSON.stringify(payload)}\n\n`); } catch (e) {} }
+  }
+}
 function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null) {
   if (type === 'reply') {
     // 受け取られる前に同じ人が同じ席を続けて呼んだ場合は1件にまとめる
@@ -563,6 +582,7 @@ function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null)
   save();
   museStatus(req, 'called');
   wakeWaiters(req);
+  emitBridgeEvent(roomId, { type: 'request', room_id: roomId, request_id: req.id, request_type: type, from_seat: ownerId ? `muse:${ownerId}` : KAPIO_ID }, ownerId || null);
   return req;
 }
 function requestView(r) {
@@ -637,7 +657,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.13</strong></p>'
++ '<p>現在のバージョン: <strong>v4.14</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -655,7 +675,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -959,6 +979,24 @@ app.get('/api/bridge/wait', bridgeAuth, (req, res) => {
     if (waiters.has(w)) { clearTimeout(w.timer); waiters.delete(w); }
     bridgeSeen.set(w.key, Date.now());
   });
+});
+// v4.14: イベントストリーム（SSE）。接続中は新規メッセージ・新規リクエストを即時に流す（ポーリングのフォールバックは従来どおり）
+app.get('/api/bridge/events', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.write(': connected\n\n');
+  const lastId = Number(req.headers['last-event-id'] || req.query.last_event_id) || 0;
+  if (lastId > 0) {
+    for (const ev of bridgeEventBuffer) {
+      if (ev.id <= lastId) continue;
+      const visible = ev.payload.type === 'request' ? bridgeSees(req.bridge, { ownerId: ev.ownerId }) : callerSeesRoom(req.bridge, ev.roomId);
+      if (visible) { try { res.write(`id: ${ev.id}\ndata: ${JSON.stringify(ev.payload)}\n\n`); } catch (e) {} }
+    }
+  }
+  const client = { caller: req.bridge, res };
+  bridgeEventClients.add(client);
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch (e) {} touchBridge(req.bridge); }, 25000);
+  req.on('close', () => { clearInterval(ping); bridgeEventClients.delete(client); });
 });
 // 考え中表示を続ける（返信まで20秒おき程度に呼ぶ）
 app.post('/api/bridge/typing', bridgeAuth, (req, res) => {
