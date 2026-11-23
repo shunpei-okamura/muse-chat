@@ -1,6 +1,17 @@
 'use strict';
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// v4.12: エスケープ済み文字列の中のURLをリンク化する（末尾の日本語句読点・括弧や引用符はリンクに含めない）
+const linkify = (s) => s.replace(/https?:\/\/[^\s<>"']+/g, (u) => {
+  let url = u, tail = '';
+  for (;;) {
+    const m = url.match(/(?:[。、！？）」』】〕〉・…]+|&(?:quot|lt|gt|#39);)$/);
+    if (!m) break;
+    tail = m[0] + tail;
+    url = url.slice(0, url.length - m[0].length);
+  }
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="msg-link">${url}</a>` + tail;
+});
 const fmtTime = (iso) => {
   if (!iso) return '';
   const d = new Date(iso), n = new Date();
@@ -297,7 +308,7 @@ function quoteHtml(m) {
   const orig = findMsg(m.replyTo);
   let text = '元のメッセージ';
   if (orig) text = orig.type === 'unsent' ? '取り消されたメッセージ' : `${orig.senderName}: ${orig.body || (orig.image ? '画像' : '')}`;
-  return `<div class="msg-quote" data-jump="${esc(m.replyTo)}">${esc(text.slice(0, 40))}</div>`;
+  return `<div class="msg-quote" data-jump="${esc(m.replyTo)}">${linkify(esc(text.slice(0, 40)))}</div>`;
 }
 function renderMessage(m) {
   if (m.type === 'system' || m.type === 'unsent') {
@@ -317,7 +328,7 @@ function renderMessage(m) {
     ${isMe ? '' : `<div class="avatar" style="background:${esc(isKapio ? '#d4a017' : (member?.color || '#888'))}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（Muse）' : ''}</div>`}
-      <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${esc(m.body)}</span>` : ''}</div>
+      <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
       <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
   const img = row.querySelector('.msg-image');

@@ -118,6 +118,7 @@ input, textarea, select { font: inherit; padding: 10px; border: 1px solid #ccc; 
 @keyframes muse-dot { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .muse-activity .dots i { animation: none; opacity: .7; } }
 .msg-bubble { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.msg-link { color: #0b57d0; text-decoration: underline; word-break: break-all; }
 .msg-quote { font-size: 12px; color: #5b6b7a; border-left: 3px solid #b9c6d3; padding: 2px 8px; margin-bottom: 6px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 230px; }
 .msg-row.me .msg-quote { color: #3d5a20; border-left-color: #5fae2e; }
 .msg-row.flash .msg-bubble { outline: 3px solid #ffd54f; transition: outline-color .6s; }
