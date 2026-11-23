@@ -455,12 +455,29 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
     }
   }
   // Muse席への依頼（v4.3: 呼ばれた席ごとに1件ずつ）
-  if (room && room.kapioEnabled && !isSeatId(senderId) && senderId !== 'system' && type === 'text') {
-    // v4.4.1: 自動が一択。名指し（席名・メンバー名）があればその席だけ、なければ全席
-    const named = namedSeatTargets(room, body, senderId);
-    const targets = named.length ? named : seatsOf(room);
-    const reqType = named.length ? 'reply' : (isGroupQuestion(body) ? 'group' : 'reply');
-    for (const s of targets) queueKapio(roomId, reqType, senderId, msg.id, s.ownerId || null);
+  // v4.7: Muse席の発言でも、名指し（席名・メンバー名）または全体宛（みんな・全員・相談らしい疑問形）なら依頼を作る。
+  //       人間の発言は従来どおり全て対象。Muse同士の連鎖防止として、人間を挟まずMuse席の発言が4件続いていたら止める。
+  if (room && room.kapioEnabled && senderId !== 'system' && type === 'text') {
+    const fromSeat = isSeatId(senderId);
+    let seatChain = 0;
+    if (fromSeat) {
+      const prev = db.messages.filter(m => m.roomId === roomId && m.id !== msg.id && m.type === 'text');
+      for (let i = prev.length - 1; i >= 0; i--) { if (isSeatId(prev[i].senderId)) seatChain++; else break; }
+    }
+    if (!fromSeat || seatChain < 4) {
+      const named = namedSeatTargets(room, body, senderId).filter(s => seatIdOf(s) !== senderId);
+      const group = isGroupQuestion(body) || /(みんな|全員|みなさん|皆さん)/.test(body || '');
+      let targets = [], reqType = 'reply';
+      if (!fromSeat) {
+        targets = named.length ? named : seatsOf(room);
+        reqType = named.length ? 'reply' : (group ? 'group' : 'reply');
+      } else if (named.length) {
+        targets = named; reqType = 'reply';
+      } else if (group) {
+        targets = seatsOf(room).filter(s => seatIdOf(s) !== senderId); reqType = 'group';
+      }
+      for (const s of targets) queueKapio(roomId, reqType, senderId, msg.id, s.ownerId || null);
+    }
   }
   saveAppend(msg);
   return msg;
@@ -610,7 +627,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.6</strong></p>'
++ '<p>現在のバージョン: <strong>v4.7</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -628,7 +645,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
