@@ -349,6 +349,13 @@ function broadcastRead(roomId, profileId) {
 function validImage(v) {
   return (typeof v === 'string' && v.startsWith('data:image/') && v.length <= 1600000) ? v : null;
 }
+// v4.11: ブリッジ投稿・返信の画像入力（image 単体 / images 配列、最大4枚）を検証して配列で返す
+function bridgeImages(body) {
+  const list = [];
+  if (body && body.image) list.push(body.image);
+  if (body && Array.isArray(body.images)) list.push(...body.images);
+  return list.map(validImage).filter(Boolean).slice(0, 4);
+}
 function previewOf(m) {
   if (m.type === 'unsent') return '送信を取り消しました';
   if (m.body) return m.body.slice(0, 80);
@@ -629,7 +636,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.10</strong></p>'
++ '<p>現在のバージョン: <strong>v4.11</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -647,7 +654,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -963,9 +970,17 @@ app.post('/api/bridge/reply', bridgeAuth, (req, res) => {
       }
     }
   }
+  const images = bridgeImages(req.body);
   let message = null;
   const earlier = r.partialMessageId ? db.messages.find(m => m.id === r.partialMessageId && m.type !== 'unsent') : null;
-  if (body && earlier) {
+  if (images.length) {
+    // v4.11: 画像は1枚ずつ別メッセージで投稿（最初の1枚にだけ本文をキャプションとして付ける）
+    images.forEach((img, i) => {
+      const cap = i === 0 ? body : '';
+      const m = postMessage(room.id, senderId, senderName, cap, img && !cap ? 'image' : 'text', img, { replyTo: r.triggerMessageId, via: 'reply' });
+      if (!message) message = m;
+    });
+  } else if (body && earlier) {
     earlier.body = body;
     earlier.editedAt = now();
     updateMessage(earlier);
@@ -1003,13 +1018,23 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   }
   if (!room) return res.status(404).json({ error: 'room not found' });
   const body = String((req.body && req.body.body) || '').trim().slice(0, 4000);
-  if (!body) return res.status(400).json({ error: 'body required' });
+  const images = bridgeImages(req.body);
+  if (!body && !images.length) return res.status(400).json({ error: 'body or image required' });
   let seat = null;
   if (req.bridge.kind === 'global') seat = seatsOf(room).find(s => !s.ownerId) || null;
   else seat = seatByOwner(room, req.bridge.profile.id);
   if (!seat) return res.status(403).json({ error: 'no seat in this room' });
-  const msg = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text', null, { via: 'post' });
-  res.json({ ok: true, message_id: msg.id });
+  // v4.11: 画像はアプリと同じ形で1枚ずつ別メッセージ（最初の1枚にだけ body をキャプションとして付ける）
+  const ids = [];
+  if (images.length) {
+    images.forEach((img, i) => {
+      const cap = i === 0 ? body : '';
+      ids.push(postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', cap, img && !cap ? 'image' : 'text', img, { via: 'post' }).id);
+    });
+  } else {
+    ids.push(postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text', null, { via: 'post' }).id);
+  }
+  res.json({ ok: true, message_id: ids[0], message_ids: ids });
 });
 // v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
 app.get('/api/bridge/history', bridgeAuth, (req, res) => {
