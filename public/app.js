@@ -13,6 +13,8 @@ try { profile = JSON.parse(localStorage.getItem('mc_profile') || 'null'); } catc
 let ws = null;
 let currentRoom = null;
 let roomsCache = [];
+let pendingImage = null;
+let chatMessages = [];
 const joinMatch = location.pathname.match(/^\/join\/([A-Za-z0-9]+)/);
 let pendingJoinCode = joinMatch ? joinMatch[1].toUpperCase() : null;
 
@@ -149,43 +151,73 @@ async function openRoom(roomId) {
   const msgs = await api(`/api/rooms/${roomId}/messages`);
   const list = $('#message-list');
   list.innerHTML = '';
+  chatMessages = [];
+  clearPendingImage();
   for (const m of msgs) appendMessage(m);
   list.scrollTop = list.scrollHeight;
+  updateReadReceipts();
   show('#view-chat');
   await api(`/api/rooms/${roomId}/read`, { method: 'POST' });
   refreshBell();
 }
 function appendMessage(m) {
   const list = $('#message-list');
+  if (m.id && list.querySelector(`[data-msg-id="${m.id}"]`)) return;
   if (m.type === 'system') {
     const div = document.createElement('div');
     div.className = 'msg-system';
+    if (m.id) div.dataset.msgId = m.id;
     div.textContent = m.body;
     list.appendChild(div);
     return;
   }
+  chatMessages.push(m);
   const isMe = m.senderId === profile.id;
   const isKapio = m.senderId === 'kapio' || String(m.senderId || '').startsWith('muse:');
   const member = currentRoom?.members.find(x => x.id === m.senderId);
   const row = document.createElement('div');
   row.className = 'msg-row' + (isMe ? ' me' : '') + (isKapio ? ' kapio' : '');
+  if (m.id) row.dataset.msgId = m.id;
   row.innerHTML = `
     ${isMe ? '' : `<div class="avatar" style="background:${esc(member?.color || '#888')}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（Muse）' : ''}</div>`}
-      <div class="msg-bubble">${esc(m.body)}</div>
-      <div class="msg-time">${fmtTime(m.createdAt)}</div>
+      <div class="msg-bubble">${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${esc(m.body)}</span>` : ''}</div>
+      <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}</span></div>
     </div>`;
+  const img = row.querySelector('.msg-image');
+  if (img) img.addEventListener('click', () => { $('#lightbox-img').src = m.image; $('#lightbox').classList.remove('hidden'); });
   list.appendChild(row);
+  if (isMe) updateReadReceipts();
+}
+function updateReadReceipts() {
+  if (!currentRoom || !profile) return;
+  const others = (currentRoom.members || []).filter(x => !x.isMuse && x.id !== profile.id);
+  if (!others.length) return;
+  for (const m of chatMessages) {
+    if (m.senderId !== profile.id) continue;
+    const el = document.getElementById('read-' + m.id);
+    if (!el) continue;
+    const readers = others.filter(x => (x.lastReadSeq || 0) >= (m.seq || 0)).length;
+    el.textContent = readers === 0 ? '' : (readers >= others.length ? '既読' : `既読 ${readers}`);
+  }
 }
 function scrollChat() { const l = $('#message-list'); l.scrollTop = l.scrollHeight; }
 
 function sendCurrent() {
   const ta = $('#composer-input');
   const body = ta.value.trim();
-  if (!body || !currentRoom) return;
+  if (!currentRoom || (!body && !pendingImage)) return;
   ta.value = '';
   ta.style.height = 'auto';
+  if (pendingImage) {
+    const image = pendingImage;
+    clearPendingImage();
+    api(`/api/rooms/${currentRoom.id}/messages`, { method: 'POST', body: JSON.stringify({ body, image }) })
+      .then(m => { appendMessage(m); scrollChat(); })
+      .catch(e => alert('画像の送信に失敗しました: ' + e.message));
+    return;
+  }
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ type: 'send', roomId: currentRoom.id, body }));
   } else {
@@ -193,6 +225,48 @@ function sendCurrent() {
       .then(m => { appendMessage(m); scrollChat(); });
   }
 }
+
+// ---------- image attach ----------
+function clearPendingImage() {
+  pendingImage = null;
+  const bar = $('#image-preview');
+  if (bar) bar.classList.add('hidden');
+  const img = $('#image-preview-img');
+  if (img) img.removeAttribute('src');
+  const input = $('#image-input');
+  if (input) input.value = '';
+}
+function downscaleToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 1280;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(c.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('image load failed')); };
+    img.src = url;
+  });
+}
+$('#image-btn').addEventListener('click', () => $('#image-input').click());
+$('#image-input').addEventListener('change', async (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    pendingImage = await downscaleToDataUrl(file);
+    $('#image-preview-img').src = pendingImage;
+    $('#image-preview').classList.remove('hidden');
+  } catch { alert('画像を読み込めませんでした'); }
+});
+$('#image-preview-remove').addEventListener('click', clearPendingImage);
+$('#lightbox').addEventListener('click', () => $('#lightbox').classList.add('hidden'));
 $('#send-btn').addEventListener('click', sendCurrent);
 $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
@@ -281,6 +355,7 @@ $('#muse-claim-btn').addEventListener('click', async () => {
     const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
     const list = $('#message-list');
     list.innerHTML = '';
+    chatMessages = [];
     for (const m of msgs) appendMessage(m);
     scrollChat();
   } catch (e) { alert(e.message); }
@@ -311,6 +386,7 @@ $('#settings-save').addEventListener('click', async (e) => {
   const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
   const list = $('#message-list');
   list.innerHTML = '';
+  chatMessages = [];
   for (const m of msgs) appendMessage(m);
   scrollChat();
 });
@@ -369,6 +445,12 @@ function connectWs() {
         loadRooms();
       }
       refreshBell();
+    } else if (data.type === 'read') {
+      if (currentRoom && data.roomId === currentRoom.id) {
+        const mem = (currentRoom.members || []).find(x => x.id === data.profileId);
+        if (mem) mem.lastReadSeq = data.lastReadSeq;
+        updateReadReceipts();
+      }
     } else if (data.type === 'notification') {
       refreshBell();
       const viewing = currentRoom && data.roomId === currentRoom.id && !$('#view-chat').classList.contains('hidden');
