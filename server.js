@@ -1027,7 +1027,6 @@ app.get('/api/bridge/history', bridgeAuth, (req, res) => {
 });
 // bridge admin (global bridge only)
 app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
-  
   if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
   const roomId = req.body && req.body.room_id;
   const profileId = req.body && req.body.profile_id;
