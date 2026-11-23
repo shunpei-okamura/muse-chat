@@ -194,12 +194,17 @@ const PRESENCE_LABEL = {
   polling: { dot: 'polling', text: '返信まで数分かかります' },
   offline: { dot: 'offline', text: '今は返信が遅れるかもしれません' },
 };
+let kapioBarOpen = false;
 function renderMuseBar() {
   if (!currentRoom) return;
   const seats = currentRoom.muses || [];
   $('#kapio-bar').classList.toggle('hidden', !seats.length);
   if (!seats.length) return;
   const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : '名前を呼ばれたときだけ返信';
+  const names = seats.map(s => s.name).join('・');
+  const agg = seats.some(s => s.presence === 'live') ? PRESENCE_LABEL.live : (seats.some(s => s.presence === 'polling') ? PRESENCE_LABEL.polling : PRESENCE_LABEL.offline);
+  $('#kapio-summary').innerHTML = `<span>🍸 ${esc(names)}（Muse）同席中 <i class="dot ${agg.dot}"></i></span><span class="kapio-chevron">${kapioBarOpen ? '▾' : '▸'}</span>`;
+  $('#kapio-detail').classList.toggle('hidden', !kapioBarOpen);
   $('#kapio-status').innerHTML = seats.map(s => {
     const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
     return `<span class="seat-line">🍸 ${esc(s.name)}（Muse）同席中<span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></span>`;
@@ -212,6 +217,7 @@ function renderMuseBar() {
     catch (e) { alert(e.message); }
   }));
 }
+$('#kapio-summary').addEventListener('click', () => { kapioBarOpen = !kapioBarOpen; renderMuseBar(); });
 function renderMuseActivity() {
   clearTimeout(activityHideTimer);
   if (!currentRoom) { museActivity.classList.add('hidden'); return; }
