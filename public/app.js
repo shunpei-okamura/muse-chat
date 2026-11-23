@@ -617,7 +617,6 @@ $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
   catch (e) { alert(e.message); }
-});
 $('#summary-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   if (!currentRoom.kapioEnabled) { alert('このルームにはMuseが同席していません'); return; }
@@ -633,8 +632,16 @@ $('#room-settings-btn').addEventListener('click', async () => {
   $('#settings-name').value = detail.name;
   $('#settings-code').textContent = detail.inviteCode;
   $('#settings-link').value = `${location.origin}/join/${detail.inviteCode}`;
-  $('#settings-members').textContent = detail.members.map(m => m.name).join('、');
   const seats = detail.muses || [];
+  const memberNames = detail.members.map(m => {
+    if (!m.isMuse) return m.name;
+    const seat = seats.find(s => s.seatId === m.id);
+    return seat && seat.ownerName ? `${m.name}（${seat.ownerName}さんのMuse）` : `${m.name}（Muse）`;
+  });
+  for (const s of seats) {
+    if (!detail.members.some(m => m.id === s.seatId)) memberNames.push(s.ownerName ? `${s.name}（${s.ownerName}さんのMuse）` : `${s.name}（Muse）`);
+  }
+  $('#settings-members').textContent = memberNames.join('、');
   $('#muse-seat-status').textContent = !seats.length
     ? 'Museは同席していません'
     : seats.map(s => s.ownerId ? `${s.name}（${s.ownerName || ''}さんのMuse）` : s.name).join('、') + ' が同席中です';
