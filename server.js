@@ -1035,7 +1035,6 @@ app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
   save();
   res.json({ ok: true });
 });
-
 app.post('/api/bridge/admin/delete-message', bridgeAuth, (req, res) => {
   if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
   const messageId = req.body && req.body.message_id;
@@ -1065,6 +1064,7 @@ app.post('/api/bridge/admin/release-seat', bridgeAuth, (req, res) => {
   postMessage(room.id, 'system', 'システム', `${name}が同席を外れました`, 'system');
   res.json({ ok: true, removed: seatId, name });
 });
+
 // app icon (PNG, embedded so install icons work without extra files)
 const ICON_PNG_B64 = [
   'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAPo0lEQVR4nO3cUbLTNhiGYR+mA1ui',
