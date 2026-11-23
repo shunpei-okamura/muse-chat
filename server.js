@@ -410,6 +410,18 @@ function mentionedSeats(room, body) {
   if (body.includes('ミューズ') || /(^|[^a-z])muse([^a-z]|$)/i.test(body)) return seats; // "museum" などには反応しない
   return seats.filter(s => s.name && body.includes(s.name));
 }
+// v4.4.1: 名指しされた席（席の名前・メンバー本人の名前から解決）。総称の場合は全席
+function namedSeatTargets(room, body, senderId) {
+  const out = [];
+  const seen = new Set();
+  const add = (s) => { if (s && !seen.has(seatIdOf(s))) { seen.add(seatIdOf(s)); out.push(s); } };
+  for (const s of mentionedSeats(room, body)) add(s);
+  for (const m of db.members.filter(x => x.roomId === room.id && !isSeatId(x.profileId) && x.profileId !== senderId)) {
+    const prof = db.profiles.find(p => p.id === m.profileId);
+    if (prof && prof.name && body.includes(prof.name)) add(seatByOwner(room, m.profileId));
+  }
+  return out;
+}
 // v4.4: 全体宛の相談らしい発言か（疑問形＋相談・日程系の言葉を含む）
 function isGroupQuestion(body) {
   if (!body) return false;
@@ -444,27 +456,11 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   }
   // Muse席への依頼（v4.3: 呼ばれた席ごとに1件ずつ）
   if (room && room.kapioEnabled && !isSeatId(senderId) && senderId !== 'system' && type === 'text') {
-    const targets = room.kapioMode === 'auto' ? seatsOf(room) : mentionedSeats(room, body);
-    for (const s of targets) queueKapio(roomId, 'reply', senderId, msg.id, s.ownerId || null);
-    // v4.4: メンバー本人の名前が呼ばれたら、その人のMuse席へ代理として依頼を立てる
-    let memberTargeted = 0;
-    if (room.kapioMode !== 'auto') {
-      const targetedOwners = new Set(targets.map(s => s.ownerId || null));
-      for (const m of db.members.filter(x => x.roomId === roomId && !isSeatId(x.profileId) && x.profileId !== senderId)) {
-        const prof = db.profiles.find(p => p.id === m.profileId);
-        if (!prof || !prof.name || !body.includes(prof.name)) continue;
-        const seat = seatByOwner(room, m.profileId);
-        if (seat && !targetedOwners.has(seat.ownerId || null)) {
-          queueKapio(roomId, 'reply', senderId, msg.id, seat.ownerId || null);
-          targetedOwners.add(seat.ownerId || null);
-          memberTargeted++;
-        }
-      }
-    }
-    // v4.4: 全体宛の相談は全席へ group 依頼として配る（誰も・どのメンバーも呼ばれていない時だけ）
-    if (room.kapioMode !== 'auto' && targets.length === 0 && memberTargeted === 0 && isGroupQuestion(body)) {
-      for (const s of seatsOf(room)) queueKapio(roomId, 'group', senderId, msg.id, s.ownerId || null);
-    }
+    // v4.4.1: 自動が一択。名指し（席名・メンバー名）があればその席だけ、なければ全席
+    const named = namedSeatTargets(room, body, senderId);
+    const targets = named.length ? named : seatsOf(room);
+    const reqType = named.length ? 'reply' : (isGroupQuestion(body) ? 'group' : 'reply');
+    for (const s of targets) queueKapio(roomId, reqType, senderId, msg.id, s.ownerId || null);
   }
   saveAppend(msg);
   return msg;
@@ -657,7 +653,7 @@ app.post('/api/rooms', auth, (req, res) => {
   const withKapio = req.body.withKapio !== false;
   const room = {
     id: id(), name, inviteCode: newInviteCode(), createdBy: req.profile.id,
-    kapioEnabled: withKapio, kapioMode: req.body.kapioMode === 'auto' ? 'auto' : 'mention',
+    kapioEnabled: withKapio, kapioMode: 'auto', // v4.4.1: 自動が一択
     muses: withKapio ? [{ ownerId: null, name: KAPIO_NAME }] : [],
     lastSummary: null, createdAt: now(), updatedAt: now(),
   };
@@ -710,7 +706,7 @@ app.post('/api/rooms/:id/settings', auth, requireMember, (req, res) => {
       postMessage(room.id, 'system', 'システム', room.kapioEnabled ? 'Museが同席するようになりました' : 'Museが同席を外れました', 'system');
     }
   }
-  if (req.body.kapioMode === 'mention' || req.body.kapioMode === 'auto') room.kapioMode = req.body.kapioMode;
+  room.kapioMode = 'auto'; // v4.4.1: 自動が一択
   save();
   res.json(roomView(room, req.profile.id));
 });

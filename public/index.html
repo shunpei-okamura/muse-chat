@@ -108,9 +108,8 @@
     <label>ルーム名<input id="create-name" type="text" maxlength="50" placeholder="例：週末の予定"></label>
     <label class="check"><input id="create-kapio" type="checkbox" checked> Museの席を用意する</label>
     <label>Museの返信スタイル
-      <select id="create-kapio-mode">
-        <option value="mention">名前を呼ばれたときだけ</option>
-        <option value="auto">会話を見て自動で口を出す</option>
+      <select id="create-kapio-mode" disabled>
+        <option value="auto" selected>会話を見て自動で返信</option>
       </select>
     </label>
     <div class="modal-btns">
@@ -155,9 +154,8 @@
       </div>
     </div>
     <label>Museの返信スタイル
-      <select id="settings-kapio-mode">
-        <option value="mention">名前を呼ばれたときだけ</option>
-        <option value="auto">会話を見て自動で口を出す</option>
+      <select id="settings-kapio-mode" disabled>
+        <option value="auto" selected>会話を見て自動で返信</option>
       </select>
     </label>
     <div class="summary-box">
@@ -191,6 +189,6 @@
   </div>
 </div>
 
-<script src="/app.js?v=4.4.0"></script>
+<script src="/app.js?v=4.4.1"></script>
 </body>
 </html>
