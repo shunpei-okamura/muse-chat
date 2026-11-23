@@ -410,6 +410,13 @@ function mentionedSeats(room, body) {
   if (body.includes('ミューズ') || /(^|[^a-z])muse([^a-z]|$)/i.test(body)) return seats; // "museum" などには反応しない
   return seats.filter(s => s.name && body.includes(s.name));
 }
+// v4.4: 全体宛の相談らしい発言か（疑問形＋相談・日程系の言葉を含む）
+function isGroupQuestion(body) {
+  if (!body) return false;
+  const question = /[？?]/.test(body) || /(しようか|どうする|どうしよう|かな|行ける|ですか|ますか|決めたい|決めよう|したい|相談|調整)/.test(body);
+  if (!question) return false;
+  return /(いつ|何日|何時|予定|日程|都合|どこ|誰|行く|行ける|集ま|決め|サウナ|温泉|ご飯|飲み|遊)/.test(body);
+}
 function postMessage(roomId, senderId, senderName, body, type = 'text', image = null, extra = {}) {
   const room = roomById(roomId);
   db.seq = (db.seq || 0) + 1;
@@ -439,6 +446,25 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   if (room && room.kapioEnabled && !isSeatId(senderId) && senderId !== 'system' && type === 'text') {
     const targets = room.kapioMode === 'auto' ? seatsOf(room) : mentionedSeats(room, body);
     for (const s of targets) queueKapio(roomId, 'reply', senderId, msg.id, s.ownerId || null);
+    // v4.4: メンバー本人の名前が呼ばれたら、その人のMuse席へ代理として依頼を立てる
+    let memberTargeted = 0;
+    if (room.kapioMode !== 'auto') {
+      const targetedOwners = new Set(targets.map(s => s.ownerId || null));
+      for (const m of db.members.filter(x => x.roomId === roomId && !isSeatId(x.profileId) && x.profileId !== senderId)) {
+        const prof = db.profiles.find(p => p.id === m.profileId);
+        if (!prof || !prof.name || !body.includes(prof.name)) continue;
+        const seat = seatByOwner(room, m.profileId);
+        if (seat && !targetedOwners.has(seat.ownerId || null)) {
+          queueKapio(roomId, 'reply', senderId, msg.id, seat.ownerId || null);
+          targetedOwners.add(seat.ownerId || null);
+          memberTargeted++;
+        }
+      }
+    }
+    // v4.4: 全体宛の相談は全席へ group 依頼として配る（誰も・どのメンバーも呼ばれていない時だけ）
+    if (room.kapioMode !== 'auto' && targets.length === 0 && memberTargeted === 0 && isGroupQuestion(body)) {
+      for (const s of seatsOf(room)) queueKapio(roomId, 'group', senderId, msg.id, s.ownerId || null);
+    }
   }
   saveAppend(msg);
   return msg;
@@ -504,10 +530,11 @@ function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null)
       return dup;
     }
   }
+  const ttlMs = type === 'group' ? 24 * 60 * 60 * 1000 : REQ_TTL_MS; // v4.4: group依頼は24時間保持
   const req = {
     id: id(), roomId, type, requestedBy, triggerMessageId: triggerMessageId || null, ownerId,
     status: 'pending', pickedAt: null, partialMessageId: null,
-    createdAt: now(), expiresAt: new Date(Date.now() + REQ_TTL_MS).toISOString(),
+    createdAt: now(), expiresAt: new Date(Date.now() + ttlMs).toISOString(),
   };
   db.kapioRequests.push(req);
   save();
@@ -903,6 +930,7 @@ app.post('/api/bridge/reply', bridgeAuth, (req, res) => {
   if (partial) {
     if (message) r.partialMessageId = message.id;
     r.pickedAt = now();
+    r.expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // v4.4: 仮答した依頼は24時間保持（オーナーの回答を待てるように）
     save();
     museStatus(r, 'thinking');
     return res.json({ ok: true, partial: true, message_id: message ? message.id : null });
@@ -917,6 +945,20 @@ app.post('/api/bridge/dismiss', bridgeAuth, (req, res) => {
   if (!bridgeSees(req.bridge, r)) return res.status(403).json({ error: 'this request belongs to another Muse' });
   if (r.status === 'pending') finishRequest(r, 'done');
   res.json({ ok: true });
+});
+// v4.4: 依頼に紐づかない自発投稿（連絡スペースの「ルームへ聞く」用）。呼び出し元の席として投稿する
+app.post('/api/bridge/post', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const room = roomById(req.body && req.body.room_id);
+  if (!room) return res.status(404).json({ error: 'room not found' });
+  const body = String((req.body && req.body.body) || '').trim().slice(0, 4000);
+  if (!body) return res.status(400).json({ error: 'body required' });
+  let seat = null;
+  if (req.bridge.kind === 'global') seat = seatsOf(room).find(s => !s.ownerId) || null;
+  else seat = seatByOwner(room, req.bridge.profile.id);
+  if (!seat) return res.status(403).json({ error: 'no seat in this room' });
+  const msg = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text');
+  res.json({ ok: true, message_id: msg.id });
 });
 // bridge admin (global bridge only)
 app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
