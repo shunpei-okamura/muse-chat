@@ -1,4 +1,9 @@
 'use strict';
+// Muse対応チャット server v4.1
+// - 永続化: Upstash を「メタ情報1キー + ルームごとのメッセージリスト」に分割（旧キーから自動移行）
+// - 読み込み失敗時は起動しない／保存失敗は検知して再試行（空DBでの上書きを防ぐ）
+// - 送信取消（24時間以内）
+// - ブリッジ即応: 長ポーリング /api/bridge/wait、考え中表示、Museの在席状況、依頼の期限切れ
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -19,10 +24,10 @@ function loadEnv() {
       if (m) env[m[1]] = m[2];
     }
   }
-  if (!env.BRIDGE_TOKEN) {
+  if (!env.BRIDGE_TOKEN && !process.env.BRIDGE_TOKEN) {
     env.BRIDGE_TOKEN = crypto.randomBytes(24).toString('hex');
     const port = env.PORT || '8377';
-    fs.writeFileSync(ENV_FILE, `PORT=${port}\nBRIDGE_TOKEN=${env.BRIDGE_TOKEN}\n`, { mode: 0o600 });
+    try { fs.writeFileSync(ENV_FILE, `PORT=${port}\nBRIDGE_TOKEN=${env.BRIDGE_TOKEN}\n`, { mode: 0o600 }); } catch { /* ignore */ }
   }
   if (process.env.PORT) env.PORT = String(process.env.PORT);
   if (process.env.BRIDGE_TOKEN) env.BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
@@ -32,62 +37,180 @@ const ENV = loadEnv();
 const PORT = parseInt(ENV.PORT || '8377', 10);
 const BRIDGE_TOKEN = ENV.BRIDGE_TOKEN;
 
-// ---------- DB (JSON persistence: local file + optional Upstash Redis) ----------
+// ---------- settings ----------
+const UNSEND_WINDOW_MS = 24 * 60 * 60 * 1000;               // 送信取消できる期間
+const REQ_TTL_MS = Number(process.env.MUSE_REQUEST_TTL_MS) || 30 * 60 * 1000; // Muse依頼の有効期限
+const PICK_RETRY_MS = 5 * 60 * 1000;                          // 受け取り後この時間返信がなければ再配布
+const LIVE_WINDOW_MS = 60 * 1000;                             // 見張り役が接続中とみなす時間
+const POLLING_WINDOW_MS = 20 * 60 * 1000;                     // 巡回で拾ってくれる見込みの時間
+const KEEP_DONE_REQ_MS = 7 * 24 * 60 * 60 * 1000;             // 処理済み依頼を保持する期間
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const id = () => crypto.randomBytes(8).toString('hex');
+const now = () => new Date().toISOString();
+
+// ---------- DB (in memory) ----------
 function emptyDb() {
-  return { profiles: [], rooms: [], members: [], messages: [], notifications: [], kapioRequests: [], decisions: [], pushSubs: [], seq: 0 };
+  return { profiles: [], rooms: [], members: [], messages: [], kapioRequests: [], decisions: [], pushSubs: [], seq: 0 };
 }
 function normalizeDb() {
-  if (!Array.isArray(db.pushSubs)) db.pushSubs = [];
-  if (!Array.isArray(db.decisions)) db.decisions = [];
-  if (!Array.isArray(db.kapioRequests)) db.kapioRequests = [];
+  for (const k of ['profiles', 'rooms', 'members', 'messages', 'kapioRequests', 'decisions', 'pushSubs']) {
+    if (!Array.isArray(db[k])) db[k] = [];
+  }
+  delete db.notifications; // v4.1: 通知は保存せず、未読メッセージから組み立てる
+  if (typeof db.seq !== 'number') db.seq = db.messages.reduce((a, m) => Math.max(a, m.seq || 0), 0);
 }
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
-let db;
-try {
-  db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-} catch {
-  db = emptyDb();
-}
-normalizeDb();
-// Optional external persistence: survives restarts/redeploys on ephemeral hosts (e.g. Render free)
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+let db = emptyDb();
+
+// ---------- persistence ----------
+const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const REMOTE_KEY = 'muse-chat-db-v1';
-async function remoteLoad() {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return false;
+const USE_REMOTE = !!(UPSTASH_URL && UPSTASH_TOKEN);
+const META_KEY = 'mc:v2:meta';
+const ROOM_KEY = (roomId) => `mc:v2:room:${roomId}:msgs`;
+const LEGACY_KEY = 'muse-chat-db-v1';
+
+// commands: [['SET', key, value], ...] をトランザクションで実行。HTTPエラーもコマンドエラーも例外にする
+async function upstash(commands, { atomic = true } = {}) {
+  const res = await fetch(`${UPSTASH_URL}/${atomic ? 'multi-exec' : 'pipeline'}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(commands),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`upstash HTTP ${res.status}: ${text.slice(0, 200)}`);
+  let out;
+  try { out = JSON.parse(text); } catch { throw new Error('upstash: invalid JSON response'); }
+  if (!Array.isArray(out)) throw new Error(`upstash: unexpected response ${text.slice(0, 200)}`);
+  for (const r of out) if (r && r.error) throw new Error(`upstash: ${r.error}`);
+  return out.map(r => (r ? r.result : null));
+}
+
+const persist = { meta: false, appends: [], rewrite: new Set(), timer: null, inflight: false, failures: 0, lastOkAt: null, lastError: null };
+let remoteReady = !USE_REMOTE; // リモートの読み込みに成功するまで、リモートへは一切書かない
+
+function metaSnapshot() {
+  const cutoff = Date.now() - KEEP_DONE_REQ_MS;
+  db.kapioRequests = db.kapioRequests.filter(r => r.status === 'pending' || Date.parse(r.handledAt || r.createdAt) > cutoff);
+  const { messages, ...meta } = db;
+  return meta;
+}
+function schedulePersist() {
+  clearTimeout(persist.timer);
+  persist.timer = setTimeout(flushAll, USE_REMOTE ? 300 : 100);
+}
+function save() { persist.meta = true; schedulePersist(); }                 // メタ情報の変更
+function saveAppend(msg) { persist.appends.push(msg); save(); }            // メッセージ追加
+function saveRewrite(roomId) { persist.rewrite.add(roomId); save(); }     // 既存メッセージの変更（取消・削除・更新）
+
+async function flushAll() {
+  if (!USE_REMOTE) { flushFile(); return; }
+  await flushRemote();
+}
+function flushFile() {
+  persist.meta = false; persist.appends = []; persist.rewrite = new Set();
   try {
-    const res = await fetch(`${UPSTASH_URL}/get/${REMOTE_KEY}`, { headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } });
-    const data = await res.json();
-    if (data && data.result) {
-      const parsed = JSON.parse(data.result);
-      if (parsed && Array.isArray(parsed.profiles)) { db = parsed; normalizeDb(); return true; }
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 1));
+    fs.renameSync(tmp, DB_FILE);
+    persist.lastOkAt = now(); persist.failures = 0; persist.lastError = null;
+  } catch (e) { persist.failures++; persist.lastError = e.message; console.error('file save failed', e); }
+}
+async function flushRemote() {
+  if (!remoteReady) return;
+  if (persist.inflight) { schedulePersist(); return; }
+  if (!persist.meta && !persist.appends.length && !persist.rewrite.size) return;
+  const meta = persist.meta, appends = persist.appends, rewrite = persist.rewrite;
+  persist.meta = false; persist.appends = []; persist.rewrite = new Set();
+
+  const cmds = [];
+  if (meta) cmds.push(['SET', META_KEY, JSON.stringify(metaSnapshot())]);
+  for (const roomId of rewrite) {
+    cmds.push(['DEL', ROOM_KEY(roomId)]);
+    const msgs = db.messages.filter(m => m.roomId === roomId).map(m => JSON.stringify(m));
+    for (let i = 0; i < msgs.length; i += 100) cmds.push(['RPUSH', ROOM_KEY(roomId), ...msgs.slice(i, i + 100)]);
+  }
+  const byRoom = new Map();
+  for (const m of appends) {
+    if (rewrite.has(m.roomId)) continue; // 書き直しに含まれる
+    if (!byRoom.has(m.roomId)) byRoom.set(m.roomId, []);
+    byRoom.get(m.roomId).push(JSON.stringify(m));
+  }
+  for (const [roomId, arr] of byRoom) cmds.push(['RPUSH', ROOM_KEY(roomId), ...arr]);
+
+  persist.inflight = true;
+  try {
+    await upstash(cmds);
+    persist.failures = 0; persist.lastOkAt = now(); persist.lastError = null;
+  } catch (e) {
+    persist.failures++; persist.lastError = e.message;
+    console.error(`remote save failed (${persist.failures})`, e.message);
+    // 失敗分を戻して再試行（トランザクションなので部分的には書かれていない）
+    persist.meta = persist.meta || meta;
+    persist.appends = appends.concat(persist.appends);
+    for (const r of rewrite) persist.rewrite.add(r);
+    clearTimeout(persist.timer);
+    persist.timer = setTimeout(flushAll, Math.min(5000 * persist.failures, 60000));
+  } finally {
+    persist.inflight = false;
+  }
+}
+
+async function remoteLoadOnce() {
+  const [metaStr, legacyStr] = await upstash([['GET', META_KEY], ['GET', LEGACY_KEY]], { atomic: false });
+  if (metaStr) {
+    const meta = JSON.parse(metaStr);
+    if (!meta || !Array.isArray(meta.profiles) || !Array.isArray(meta.rooms)) throw new Error('meta is broken');
+    const lists = meta.rooms.length
+      ? await upstash(meta.rooms.map(r => ['LRANGE', ROOM_KEY(r.id), '0', '-1']), { atomic: false })
+      : [];
+    const seen = new Set();
+    const messages = [];
+    for (const list of lists) {
+      for (const s of list || []) {
+        let m; try { m = JSON.parse(s); } catch { continue; }
+        if (!m || !m.id || seen.has(m.id)) continue;
+        seen.add(m.id); messages.push(m);
+      }
     }
-  } catch (e) { console.error('remoteLoad failed', e); }
-  return false;
+    messages.sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    db = { ...meta, messages };
+    normalizeDb();
+    return 'v2';
+  }
+  if (legacyStr) {
+    const parsed = JSON.parse(legacyStr);
+    if (!parsed || !Array.isArray(parsed.profiles)) throw new Error('legacy data is broken');
+    db = parsed;
+    normalizeDb();
+    // 新形式へ書き出す（旧キーはバックアップとして残す）
+    persist.meta = true;
+    for (const r of db.rooms) persist.rewrite.add(r.id);
+    return 'migrated';
+  }
+  db = emptyDb();
+  return 'empty';
 }
-let remoteSaveTimer = null;
-function remoteSave() {
-  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
-  clearTimeout(remoteSaveTimer);
-  remoteSaveTimer = setTimeout(() => {
-    fetch(`${UPSTASH_URL}/set/${REMOTE_KEY}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-      body: JSON.stringify(db),
-    }).catch(e => console.error('remoteSave failed', e));
-  }, 300);
-}
-let saveTimer = null;
-function save() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+async function loadDb() {
+  if (!USE_REMOTE) {
+    try { db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { db = emptyDb(); }
+    normalizeDb();
+    return 'file';
+  }
+  let lastErr;
+  for (let attempt = 1; attempt <= 6; attempt++) {
     try {
-      const tmp = DB_FILE + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(db, null, 1));
-      fs.renameSync(tmp, DB_FILE);
-    } catch (e) { console.error('file save failed', e); }
-  }, 100);
-  remoteSave();
+      const how = await remoteLoadOnce();
+      remoteReady = true;
+      return how;
+    } catch (e) {
+      lastErr = e;
+      console.error(`remote load attempt ${attempt} failed:`, e.message);
+      await sleep(Math.min(2000 * attempt, 10000));
+    }
+  }
+  throw lastErr;
 }
 
 // ---------- Web Push (VAPID) ----------
@@ -111,8 +234,8 @@ function sendPushToProfile(profileId, payload) {
     });
   }
 }
-const id = () => crypto.randomBytes(8).toString('hex');
-const now = () => new Date().toISOString();
+
+// ---------- helpers ----------
 const COLORS = ['#e17055', '#0984e3', '#00b894', '#6c5ce7', '#d63031', '#e84393', '#fdcb6e', '#00cec9', '#fab1a0', '#74b9ff'];
 function colorFor(seed) {
   let h = 0;
@@ -127,26 +250,32 @@ function newInviteCode() {
     if (!db.rooms.some(r => r.inviteCode === code)) return code;
   }
 }
-
 const KAPIO_ID = 'kapio';
 const KAPIO_NAME = 'カピお';
-// ---------- Muse seat (generalized: each member can bring their own Muse) ----------
 const isSeatId = (x) => x === KAPIO_ID || (typeof x === 'string' && x.startsWith('muse:'));
+const roomById = (roomId) => db.rooms.find(r => r.id === roomId) || null;
+
 function seatName(room) {
   if (room.muse && room.muse.name) return room.muse.name;
   return db.members.some(m => m.roomId === room.id && m.profileId === KAPIO_ID) ? KAPIO_NAME : 'Muse';
 }
+// ルームの席を担当するブリッジのキー（'global' = カピお専用トークン、それ以外は持ち主のprofileId）
+function seatBridgeKey(room) {
+  if (!room || !room.kapioEnabled) return null;
+  if (room.muse && room.muse.ownerId) return room.muse.ownerId;
+  return 'global';
+}
 function seatInfo(room) {
   const owner = room.muse && room.muse.ownerId ? db.profiles.find(p => p.id === room.muse.ownerId) : null;
+  const key = seatBridgeKey(room);
   return {
     active: !!room.kapioEnabled,
     name: seatName(room),
     ownerId: room.muse ? (room.muse.ownerId || null) : null,
     ownerName: owner ? owner.name : null,
+    presence: key ? bridgePresence(key) : 'offline',
   };
 }
-
-// ---------- helpers ----------
 function profileByToken(token) {
   if (!token) return null;
   return db.profiles.find(p => p.token === token) || null;
@@ -155,27 +284,33 @@ function memberOf(roomId, profileId) {
   return db.members.find(m => m.roomId === roomId && m.profileId === profileId) || null;
 }
 function roomMembers(roomId) {
+  const room = roomById(roomId);
   return db.members.filter(m => m.roomId === roomId).map(m => {
     if (isSeatId(m.profileId)) {
-      const room = db.rooms.find(r => r.id === roomId);
       return { id: m.profileId, name: room ? seatName(room) : 'Muse', color: '#d4a017', isKapio: m.profileId === KAPIO_ID, isMuse: true, lastReadSeq: null };
     }
     const p = db.profiles.find(x => x.id === m.profileId);
     return p ? { id: p.id, name: p.name, color: p.color, isKapio: false, isMuse: false, lastReadSeq: m.lastReadSeq || 0 } : null;
   }).filter(Boolean);
 }
+const countsAsUnread = (m, profileId) => m.senderId !== profileId && m.type !== 'system' && m.type !== 'unsent';
+function lastSeqOf(roomId) {
+  for (let i = db.messages.length - 1; i >= 0; i--) if (db.messages[i].roomId === roomId) return db.messages[i].seq || 0;
+  return 0;
+}
 function unreadCount(roomId, profileId) {
   const mem = memberOf(roomId, profileId);
   if (!mem) return 0;
   const lastSeq = mem.lastReadSeq || 0;
-  return db.messages.filter(m => m.roomId === roomId && m.senderId !== profileId && (m.seq || 0) > lastSeq).length;
+  return db.messages.filter(m => m.roomId === roomId && (m.seq || 0) > lastSeq && countsAsUnread(m, profileId)).length;
+}
+function unreadTotal(profileId) {
+  return db.members.filter(m => m.profileId === profileId).reduce((a, m) => a + unreadCount(m.roomId, profileId), 0);
 }
 function markRoomRead(roomId, profileId) {
   const mem = memberOf(roomId, profileId);
   if (!mem) return 0;
-  const msgs = db.messages.filter(m => m.roomId === roomId);
-  mem.lastReadSeq = msgs.length ? (msgs[msgs.length - 1].seq || 0) : 0;
-  for (const n of db.notifications) if (n.profileId === profileId && n.roomId === roomId) n.read = true;
+  mem.lastReadSeq = lastSeqOf(roomId);
   return mem.lastReadSeq;
 }
 function broadcastRead(roomId, profileId) {
@@ -186,19 +321,41 @@ function broadcastRead(roomId, profileId) {
 function validImage(v) {
   return (typeof v === 'string' && v.startsWith('data:image/') && v.length <= 1600000) ? v : null;
 }
+function previewOf(m) {
+  if (m.type === 'unsent') return '送信を取り消しました';
+  if (m.body) return m.body.slice(0, 80);
+  return m.image ? '画像を送信しました' : '';
+}
 function roomView(room, profileId) {
-  const msgs = db.messages.filter(m => m.roomId === room.id);
-  const last = msgs[msgs.length - 1] || null;
+  let last = null;
+  for (let i = db.messages.length - 1; i >= 0; i--) if (db.messages[i].roomId === room.id) { last = db.messages[i]; break; }
   return {
-    id: room.id, name: room.name, inviteCode: room.inviteCode,
+    id: room.id, name: room.name, inviteCode: room.inviteCode, createdBy: room.createdBy,
     kapioEnabled: room.kapioEnabled, kapioMode: room.kapioMode,
     members: roomMembers(room.id),
-    lastMessage: last ? { body: last.body || (last.image ? '画像を送信しました' : ''), senderName: last.senderName, createdAt: last.createdAt } : null,
+    lastMessage: last ? { body: previewOf(last), senderName: last.senderName, createdAt: last.createdAt } : null,
     unread: profileId ? unreadCount(room.id, profileId) : 0,
     lastSummary: room.lastSummary || null,
     museSeat: seatInfo(room),
     updatedAt: room.updatedAt || room.createdAt,
   };
+}
+function roomDetail(room, profileId) {
+  return {
+    ...roomView(room, profileId),
+    decisions: db.decisions.filter(d => d.roomId === room.id),
+    museActivity: db.kapioRequests
+      .filter(r => r.roomId === room.id && r.status === 'pending')
+      .map(r => ({ requestId: r.id, type: r.type, state: r.pickedAt ? 'thinking' : 'called' })),
+  };
+}
+// 自分の発言、または自分のMuseの発言なら取り消せる
+function canUnsend(msg, profileId) {
+  if (!msg || msg.type === 'system' || msg.type === 'unsent') return false;
+  const room = roomById(msg.roomId);
+  const ownsLegacyKapio = msg.senderId === KAPIO_ID && room && room.createdBy === profileId; // 旧カピお席はルーム作成者が管理
+  if (msg.senderId !== profileId && msg.senderId !== `muse:${profileId}` && !ownsLegacyKapio) return false;
+  return Date.now() - Date.parse(msg.createdAt) <= UNSEND_WINDOW_MS;
 }
 
 // ---------- WebSocket ----------
@@ -217,54 +374,182 @@ function broadcastRoom(roomId, obj, exceptProfileId) {
 }
 
 // ---------- core: post message ----------
-function postMessage(roomId, senderId, senderName, body, type = 'text', image = null) {
+function mentionsSeat(room, body) {
+  if (!body) return false;
+  const name = seatName(room);
+  if (name && body.includes(name)) return true;
+  if (body.includes('ミューズ')) return true;
+  if (/(^|[^a-z])muse([^a-z]|$)/i.test(body)) return true; // "museum" などには反応しない
+  if (!(room.muse && room.muse.ownerId) && body.includes(KAPIO_NAME)) return true; // レガシー席のみ
+  return false;
+}
+function postMessage(roomId, senderId, senderName, body, type = 'text', image = null, extra = {}) {
+  const room = roomById(roomId);
   db.seq = (db.seq || 0) + 1;
-  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, createdAt: now() };
+  let replyTo = null;
+  if (extra.replyTo && db.messages.some(m => m.id === extra.replyTo && m.roomId === roomId)) replyTo = extra.replyTo;
+  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, replyTo, createdAt: now() };
   db.messages.push(msg);
-  const room = db.rooms.find(r => r.id === roomId);
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
-  const preview = body ? body.slice(0, 80) : (image ? '画像を送信しました' : '');
-  // notifications for other human members
-  for (const m of db.members.filter(x => x.roomId === roomId)) {
-    if (isSeatId(m.profileId) || m.profileId === senderId) continue;
-    const n = {
-      id: id(), profileId: m.profileId, roomId, messageId: msg.id,
-      preview, senderName, roomName: room ? room.name : '',
-      createdAt: msg.createdAt, read: false,
-    };
-    db.notifications.push(n);
-    const unreadTotal = db.notifications.filter(x => x.profileId === m.profileId && !x.read).length;
-    wsSend(m.profileId, { type: 'notification', notification: n, unreadTotal, roomId, unreadInRoom: unreadCount(roomId, m.profileId) });
-    sendPushToProfile(m.profileId, { title: room ? room.name : 'Muse対応チャット', body: `${senderName}: ${preview}`, roomId });
+
+  if (type !== 'system') {
+    const preview = previewOf(msg);
+    for (const m of db.members.filter(x => x.roomId === roomId)) {
+      if (isSeatId(m.profileId) || m.profileId === senderId) continue;
+      const n = { id: msg.id, profileId: m.profileId, roomId, messageId: msg.id, preview, senderName, roomName: room ? room.name : '', createdAt: msg.createdAt, read: false };
+      wsSend(m.profileId, { type: 'notification', notification: n, unreadTotal: unreadTotal(m.profileId), roomId, unreadInRoom: unreadCount(roomId, m.profileId) });
+      const p = db.profiles.find(x => x.id === m.profileId);
+      const showBody = !(p && p.pushPreview === false);
+      sendPushToProfile(m.profileId, {
+        title: room ? room.name : 'Muse対応チャット',
+        body: showBody ? `${senderName}: ${preview}` : '新着メッセージがあります',
+        roomId,
+      });
+    }
   }
-  // Muse seat queue: mention the seat's name, "Muse" or "ミューズ"
+  // Muse席への依頼
   if (room && room.kapioEnabled && !isSeatId(senderId) && senderId !== 'system' && type === 'text') {
-    const mentioned = body.includes(seatName(room)) || body.includes('カピお') || body.includes('ミューズ') || /muse/i.test(body);
-    if ((room.kapioMode === 'mention' && mentioned) || room.kapioMode === 'auto') {
+    if ((room.kapioMode === 'mention' && mentionsSeat(room, body)) || room.kapioMode === 'auto') {
       queueKapio(roomId, 'reply', senderId, msg.id);
     }
   }
-  save();
+  saveAppend(msg);
   return msg;
 }
-function queueKapio(roomId, type, requestedBy, triggerMessageId) {
-  const room = db.rooms.find(r => r.id === roomId);
-  const req = { id: id(), roomId, type, requestedBy, triggerMessageId: triggerMessageId || null, ownerId: room && room.muse ? (room.muse.ownerId || null) : null, status: 'pending', createdAt: now() };
-  db.kapioRequests.push(req);
-  save();
-  return req;
+function updateMessage(msg) {
+  saveRewrite(msg.roomId);
+  broadcastRoom(msg.roomId, { type: 'message_updated', roomId: msg.roomId, message: msg });
 }
 function roomContext(roomId, limit = 30) {
-  return db.messages.filter(m => m.roomId === roomId).slice(-limit)
-    .map(m => ({ senderName: m.senderName, senderId: m.senderId, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, createdAt: m.createdAt }));
+  return db.messages.filter(m => m.roomId === roomId && m.type !== 'unsent').slice(-limit)
+    .map(m => ({ id: m.id, senderName: m.senderName, senderId: m.senderId, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, replyTo: m.replyTo || null, createdAt: m.createdAt }));
+}
+
+// ---------- Muse requests + bridge presence ----------
+const bridgeSeen = new Map();   // key -> 最終接触時刻(ms)
+const waiters = new Set();      // 長ポーリング中の見張り役 { key, caller, res, timer }
+const lastPresence = new Map(); // key -> 最後に配信した在席状況
+
+const callerKey = (caller) => (caller.kind === 'global' ? 'global' : caller.profile.id);
+function bridgePresence(key) {
+  for (const w of waiters) if (w.key === key) return 'live';
+  const t = bridgeSeen.get(key);
+  if (t && Date.now() - t < LIVE_WINDOW_MS) return 'live';
+  if (t && Date.now() - t < POLLING_WINDOW_MS) return 'polling';
+  return 'offline';
+}
+function checkPresence() {
+  for (const room of db.rooms) {
+    const key = seatBridgeKey(room);
+    if (!key) continue;
+    const p = bridgePresence(key);
+    if (lastPresence.get(room.id) !== p) {
+      lastPresence.set(room.id, p);
+      broadcastRoom(room.id, { type: 'muse_presence', roomId: room.id, presence: p });
+    }
+  }
+}
+function touchBridge(caller) {
+  bridgeSeen.set(callerKey(caller), Date.now());
+  checkPresence();
+}
+function bridgeSees(caller, r) {
+  return caller.kind === 'global' ? !r.ownerId : r.ownerId === caller.profile.id;
+}
+function museStatus(r, state) {
+  const room = roomById(r.roomId);
+  broadcastRoom(r.roomId, {
+    type: 'muse_status', roomId: r.roomId, requestId: r.id, requestType: r.type, state,
+    name: room ? seatName(room) : 'Muse',
+    presence: room ? bridgePresence(seatBridgeKey(room) || 'global') : 'offline',
+  });
+}
+function queueKapio(roomId, type, requestedBy, triggerMessageId) {
+  const room = roomById(roomId);
+  const ownerId = room && room.muse ? (room.muse.ownerId || null) : null;
+  if (type === 'reply') {
+    // 受け取られる前に同じ人が続けて呼んだ場合は1件にまとめる
+    const dup = db.kapioRequests.find(r => r.status === 'pending' && r.roomId === roomId && r.type === 'reply' && r.requestedBy === requestedBy && !r.pickedAt);
+    if (dup) {
+      if (triggerMessageId) dup.triggerMessageId = triggerMessageId;
+      dup.expiresAt = new Date(Date.now() + REQ_TTL_MS).toISOString();
+      save();
+      return dup;
+    }
+  }
+  const req = {
+    id: id(), roomId, type, requestedBy, triggerMessageId: triggerMessageId || null, ownerId,
+    status: 'pending', pickedAt: null, partialMessageId: null,
+    createdAt: now(), expiresAt: new Date(Date.now() + REQ_TTL_MS).toISOString(),
+  };
+  db.kapioRequests.push(req);
+  save();
+  museStatus(req, 'called');
+  wakeWaiters(req);
+  return req;
+}
+function requestView(r) {
+  const room = roomById(r.roomId);
+  const trigger = r.triggerMessageId ? db.messages.find(m => m.id === r.triggerMessageId) : null;
+  return {
+    request_id: r.id, type: r.type, room_id: r.roomId,
+    room_name: room ? room.name : null,
+    muse_name: room ? seatName(room) : null,
+    members: room ? roomMembers(room.id) : [],
+    requested_by: r.requestedBy, created_at: r.createdAt, expires_at: r.expiresAt,
+    picked: !!r.pickedAt, picked_at: r.pickedAt || null,
+    trigger: trigger && trigger.type !== 'unsent'
+      ? { id: trigger.id, sender_name: trigger.senderName, body: trigger.body, has_image: !!trigger.image }
+      : null,
+    context: roomContext(r.roomId, 30),
+    decisions: db.decisions.filter(d => d.roomId === r.roomId).map(d => d.text),
+    summary: room ? (room.lastSummary || null) : null,
+  };
+}
+// 見張り役に渡す依頼（未受け取り、または受け取り後に放置されたもの）を確保する
+function takeForWatcher(caller) {
+  const t = Date.now();
+  const list = db.kapioRequests.filter(r => r.status === 'pending' && bridgeSees(caller, r) && (!r.pickedAt || t - Date.parse(r.pickedAt) > PICK_RETRY_MS));
+  // メンションへの返信を優先し、要約は後回し
+  list.sort((a, b) => (a.type === b.type ? 0 : a.type === 'reply' ? -1 : 1) || a.createdAt.localeCompare(b.createdAt));
+  for (const r of list) { r.pickedAt = now(); museStatus(r, 'thinking'); }
+  if (list.length) save();
+  return list.map(requestView);
+}
+function wakeWaiters(req) {
+  for (const w of [...waiters]) {
+    if (!bridgeSees(w.caller, req)) continue;
+    clearTimeout(w.timer);
+    waiters.delete(w);
+    const pending = takeForWatcher(w.caller);
+    if (!w.res.headersSent) w.res.json({ pending });
+    if (pending.length) return;
+  }
+}
+function finishRequest(r, state = 'done') {
+  r.status = state === 'expired' ? 'expired' : 'done';
+  r.handledAt = now();
+  save();
+  museStatus(r, state);
+}
+function expireRequests() {
+  const t = Date.now();
+  for (const r of db.kapioRequests) {
+    if (r.status === 'pending' && r.expiresAt && Date.parse(r.expiresAt) < t) finishRequest(r, 'expired');
+  }
 }
 
 // ---------- Express ----------
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, name: 'muse-chat', time: now() }));
+app.get('/api/health', (req, res) => res.json({
+  ok: persist.failures < 3,
+  name: 'muse-chat', time: now(),
+  storage: USE_REMOTE ? 'upstash' : 'file',
+  lastSaveOkAt: persist.lastOkAt, saveFailures: persist.failures, lastSaveError: persist.lastError,
+}));
 
 function auth(req, res, next) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.headers['x-profile-token'];
@@ -280,20 +565,26 @@ function bridgeAuth(req, res, next) {
   if (p) { req.bridge = { kind: 'profile', profile: p }; return next(); }
   return res.status(401).json({ error: 'invalid bridge token' });
 }
-function bridgeSees(caller, r) {
-  return caller.kind === 'global' ? !r.ownerId : r.ownerId === caller.profile.id;
-}
 
 // profiles
 app.post('/api/profiles', (req, res) => {
   const name = String(req.body.name || '').trim().slice(0, 30);
-  if (!name) return res.status(400).json({ error: 'name required' });
-  const p = { id: id(), name, color: colorFor(name + id()), token: crypto.randomBytes(20).toString('hex'), createdAt: now() };
+  if (!name) return res.status(400).json({ error: '表示名を入れてください' });
+  const p = { id: id(), name, color: colorFor(name + id()), token: crypto.randomBytes(20).toString('hex'), pushPreview: true, createdAt: now() };
   db.profiles.push(p);
   save();
   res.json({ id: p.id, name: p.name, color: p.color, token: p.token });
 });
-app.get('/api/me', auth, (req, res) => res.json({ id: req.profile.id, name: req.profile.name, color: req.profile.color, museName: req.profile.museName || null, hasBridgeToken: !!req.profile.bridgeToken }));
+app.get('/api/me', auth, (req, res) => res.json({
+  id: req.profile.id, name: req.profile.name, color: req.profile.color,
+  museName: req.profile.museName || null, hasBridgeToken: !!req.profile.bridgeToken,
+  pushPreview: req.profile.pushPreview !== false,
+}));
+app.post('/api/me/settings', auth, (req, res) => {
+  if (typeof req.body.pushPreview === 'boolean') req.profile.pushPreview = req.body.pushPreview;
+  save();
+  res.json({ ok: true, pushPreview: req.profile.pushPreview !== false });
+});
 app.post('/api/me/bridge-token', auth, (req, res) => {
   if (!req.profile.bridgeToken || (req.body && req.body.reset)) {
     req.profile.bridgeToken = crypto.randomBytes(20).toString('hex');
@@ -304,7 +595,7 @@ app.post('/api/me/bridge-token', auth, (req, res) => {
 
 // rooms
 app.get('/api/rooms', auth, (req, res) => {
-  const myRooms = db.members.filter(m => m.profileId === req.profile.id).map(m => db.rooms.find(r => r.id === m.roomId)).filter(Boolean);
+  const myRooms = db.members.filter(m => m.profileId === req.profile.id).map(m => roomById(m.roomId)).filter(Boolean);
   res.json(myRooms.map(r => roomView(r, req.profile.id)).sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')));
 });
 app.post('/api/rooms', auth, (req, res) => {
@@ -316,7 +607,7 @@ app.post('/api/rooms', auth, (req, res) => {
     lastSummary: null, createdAt: now(), updatedAt: now(),
   };
   db.rooms.push(room);
-  db.members.push({ roomId: room.id, profileId: req.profile.id, lastReadMessageId: null, joinedAt: now() });
+  db.members.push({ roomId: room.id, profileId: req.profile.id, lastReadSeq: 0, joinedAt: now() });
   save();
   res.json(roomView(room, req.profile.id));
 });
@@ -329,22 +620,22 @@ app.post('/api/rooms/join', auth, (req, res) => {
   const room = db.rooms.find(r => r.inviteCode === String(req.body.code || '').trim().toUpperCase());
   if (!room) return res.status(404).json({ error: 'room not found' });
   if (!memberOf(room.id, req.profile.id)) {
-    db.members.push({ roomId: room.id, profileId: req.profile.id, lastReadMessageId: null, joinedAt: now() });
+    // 参加前のメッセージを未読にしない
+    db.members.push({ roomId: room.id, profileId: req.profile.id, lastReadSeq: lastSeqOf(room.id), joinedAt: now() });
     postMessage(room.id, 'system', 'システム', `${req.profile.name}さんが参加しました`, 'system');
+    markRoomRead(room.id, req.profile.id);
   }
   save();
   res.json(roomView(room, req.profile.id));
 });
 function requireMember(req, res, next) {
-  const room = db.rooms.find(r => r.id === req.params.id);
+  const room = roomById(req.params.id);
   if (!room) return res.status(404).json({ error: 'room not found' });
   if (!memberOf(room.id, req.profile.id)) return res.status(403).json({ error: 'not a member' });
   req.room = room;
   next();
 }
-app.get('/api/rooms/:id', auth, requireMember, (req, res) => {
-  res.json({ ...roomView(req.room, req.profile.id), decisions: db.decisions.filter(d => d.roomId === req.room.id) });
-});
+app.get('/api/rooms/:id', auth, requireMember, (req, res) => res.json(roomDetail(req.room, req.profile.id)));
 app.post('/api/rooms/:id/settings', auth, requireMember, (req, res) => {
   const room = req.room;
   if (typeof req.body.name === 'string' && req.body.name.trim()) room.name = req.body.name.trim().slice(0, 50);
@@ -352,11 +643,9 @@ app.post('/api/rooms/:id/settings', auth, requireMember, (req, res) => {
     const was = room.kapioEnabled;
     room.kapioEnabled = req.body.kapioEnabled;
     if (room.kapioEnabled && room.muse && room.muse.ownerId && !memberOf(room.id, `muse:${room.muse.ownerId}`)) {
-      db.members.push({ roomId: room.id, profileId: `muse:${room.muse.ownerId}`, lastReadMessageId: null, joinedAt: now() });
+      db.members.push({ roomId: room.id, profileId: `muse:${room.muse.ownerId}`, lastReadSeq: null, joinedAt: now() });
     }
-    if (!room.kapioEnabled) {
-      db.members = db.members.filter(m => !(m.roomId === room.id && isSeatId(m.profileId)));
-    }
+    if (!room.kapioEnabled) db.members = db.members.filter(m => !(m.roomId === room.id && isSeatId(m.profileId)));
     if (was !== room.kapioEnabled) {
       postMessage(room.id, 'system', 'システム', room.kapioEnabled ? 'Museが同席するようになりました' : 'Museが同席を外れました', 'system');
     }
@@ -365,8 +654,14 @@ app.post('/api/rooms/:id/settings', auth, requireMember, (req, res) => {
   save();
   res.json(roomView(room, req.profile.id));
 });
+
+// messages
 app.get('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
   let msgs = db.messages.filter(m => m.roomId === req.room.id);
+  if (req.query.after) {
+    const after = Number(req.query.after);
+    return res.json(msgs.filter(m => (m.seq || 0) > after).slice(0, 300));
+  }
   if (req.query.before) msgs = msgs.filter(m => (m.seq || 0) < Number(req.query.before));
   res.json(msgs.slice(-100));
 });
@@ -374,7 +669,23 @@ app.post('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 4000);
   const image = validImage(req.body.image);
   if (!body && !image) return res.status(400).json({ error: 'body required' });
-  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body, image && !body ? 'image' : 'text', image);
+  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body, image && !body ? 'image' : 'text', image, { replyTo: req.body.replyTo });
+  res.json(msg);
+});
+app.post('/api/messages/:msgId/unsend', auth, (req, res) => {
+  const msg = db.messages.find(m => m.id === req.params.msgId);
+  if (!msg || !memberOf(msg.roomId, req.profile.id)) return res.status(404).json({ error: 'メッセージが見つかりません' });
+  if (msg.type === 'unsent') return res.json(msg);
+  if (!canUnsend(msg, req.profile.id)) return res.status(403).json({ error: '送信取消できるのは、自分（または自分のMuse）の24時間以内のメッセージだけです' });
+  msg.type = 'unsent';
+  msg.body = '';
+  msg.image = null;
+  msg.unsentAt = now();
+  // この発言をきっかけにした未処理のMuse依頼は取り下げる
+  for (const r of db.kapioRequests) {
+    if (r.status === 'pending' && r.triggerMessageId === msg.id) { r.cancelReason = 'unsent'; finishRequest(r, 'done'); }
+  }
+  updateMessage(msg);
   res.json(msg);
 });
 app.post('/api/rooms/:id/read', auth, requireMember, (req, res) => {
@@ -384,45 +695,51 @@ app.post('/api/rooms/:id/read', auth, requireMember, (req, res) => {
   res.json({ ok: true });
 });
 app.post('/api/rooms/:id/call-kapio', auth, requireMember, (req, res) => {
-  if (!req.room.kapioEnabled) return res.status(400).json({ error: 'kapio is not in this room' });
+  if (!req.room.kapioEnabled) return res.status(400).json({ error: 'このルームにはMuseが同席していません' });
   const r = queueKapio(req.room.id, 'reply', req.profile.id, null);
-  res.json({ ok: true, requestId: r.id });
+  res.json({ ok: true, requestId: r.id, presence: seatInfo(req.room).presence });
 });
 app.post('/api/rooms/:id/summary-request', auth, requireMember, (req, res) => {
-  if (!req.room.kapioEnabled) return res.status(400).json({ error: 'kapio is not in this room' });
+  if (!req.room.kapioEnabled) return res.status(400).json({ error: 'このルームにはMuseが同席していません' });
   const r = queueKapio(req.room.id, 'summary', req.profile.id, null);
-  res.json({ ok: true, requestId: r.id });
+  res.json({ ok: true, requestId: r.id, presence: seatInfo(req.room).presence });
 });
+
 // Muse seat claim / release
 app.post('/api/rooms/:id/muse-claim', auth, requireMember, (req, res) => {
   const room = req.room;
+  const hasOtherOwner = room.muse && room.muse.ownerId && room.muse.ownerId !== req.profile.id;
+  const hasLegacy = !room.muse && db.members.some(m => m.roomId === room.id && m.profileId === KAPIO_ID);
+  if (hasOtherOwner || hasLegacy) {
+    return res.status(409).json({ error: `Museの席は${seatName(room)}が使っています。先に「同席をやめる」をしてもらってください` });
+  }
   const name = String((req.body && req.body.name) || '').trim().slice(0, 30) || req.profile.museName || 'Muse';
   req.profile.museName = name;
   db.members = db.members.filter(m => !(m.roomId === room.id && isSeatId(m.profileId)));
-  room.muse = { ownerId: req.profile.id, name };
+  room.muse = { ownerId: req.profile.id, name, joinedSeq: db.seq || 0 };
   room.kapioEnabled = true;
-  db.members.push({ roomId: room.id, profileId: `muse:${req.profile.id}`, lastReadMessageId: null, joinedAt: now() });
+  db.members.push({ roomId: room.id, profileId: `muse:${req.profile.id}`, lastReadSeq: null, joinedAt: now() });
   save();
   postMessage(room.id, 'system', 'システム', `${name}（${req.profile.name}さんのMuse）が同席するようになりました`, 'system');
-  res.json({ ...roomView(room, req.profile.id), decisions: db.decisions.filter(d => d.roomId === room.id) });
+  res.json(roomDetail(room, req.profile.id));
 });
 app.post('/api/rooms/:id/muse-release', auth, requireMember, (req, res) => {
   const room = req.room;
   const isOwner = !!(room.muse && room.muse.ownerId === req.profile.id);
   const isCreator = room.createdBy === req.profile.id;
-  if (room.muse && !isOwner && !isCreator) return res.status(403).json({ error: 'only the Muse owner or the room creator can release the seat' });
+  if (room.muse && !isOwner && !isCreator) return res.status(403).json({ error: '席を外せるのは、Museの持ち主かルームを作った人だけです' });
   const name = seatName(room);
+  for (const r of db.kapioRequests) if (r.roomId === room.id && r.status === 'pending') finishRequest(r, 'done');
   db.members = db.members.filter(m => !(m.roomId === room.id && isSeatId(m.profileId)));
   room.muse = null;
   room.kapioEnabled = false;
   save();
   postMessage(room.id, 'system', 'システム', `${name}が同席を外れました`, 'system');
-  res.json({ ...roomView(room, req.profile.id), decisions: db.decisions.filter(d => d.roomId === room.id) });
+  res.json(roomDetail(room, req.profile.id));
 });
+
 // decisions
-app.get('/api/rooms/:id/decisions', auth, requireMember, (req, res) => {
-  res.json(db.decisions.filter(d => d.roomId === req.room.id));
-});
+app.get('/api/rooms/:id/decisions', auth, requireMember, (req, res) => res.json(db.decisions.filter(d => d.roomId === req.room.id)));
 app.post('/api/rooms/:id/decisions', auth, requireMember, (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
@@ -437,14 +754,23 @@ app.delete('/api/rooms/:id/decisions/:decId', auth, requireMember, (req, res) =>
   res.json({ ok: true });
 });
 
-// notifications
+// notifications（保存せず、所属ルームのメッセージから組み立てる）
 app.get('/api/notifications', auth, (req, res) => {
-  const list = db.notifications.filter(n => n.profileId === req.profile.id).slice(-100).reverse();
-  const unreadTotal = db.notifications.filter(n => n.profileId === req.profile.id && !n.read).length;
-  res.json({ notifications: list, unreadTotal });
+  const lastRead = new Map(db.members.filter(m => m.profileId === req.profile.id).map(m => [m.roomId, m.lastReadSeq || 0]));
+  const list = [];
+  for (let i = db.messages.length - 1; i >= 0 && list.length < 100; i--) {
+    const m = db.messages[i];
+    if (!lastRead.has(m.roomId) || !countsAsUnread(m, req.profile.id)) continue;
+    const room = roomById(m.roomId);
+    list.push({ id: m.id, roomId: m.roomId, messageId: m.id, preview: previewOf(m), senderName: m.senderName, roomName: room ? room.name : '', createdAt: m.createdAt, read: (m.seq || 0) <= lastRead.get(m.roomId) });
+  }
+  res.json({ notifications: list, unreadTotal: unreadTotal(req.profile.id) });
 });
 app.post('/api/notifications/read-all', auth, (req, res) => {
-  for (const n of db.notifications) if (n.profileId === req.profile.id) n.read = true;
+  for (const m of db.members.filter(x => x.profileId === req.profile.id)) {
+    markRoomRead(m.roomId, req.profile.id);
+    broadcastRead(m.roomId, req.profile.id);
+  }
   save();
   res.json({ ok: true });
 });
@@ -460,75 +786,114 @@ app.post('/api/push/subscribe', auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- bridge API (external Claude / Kapio) ----------
+// ---------- bridge API (Muse) ----------
+// 従来の一覧取得（10分巡回のhookなど）。picked=true は見張り役が処理中
 app.get('/api/bridge/pending', bridgeAuth, (req, res) => {
-  const pending = db.kapioRequests.filter(r => r.status === 'pending' && bridgeSees(req.bridge, r)).map(r => {
-    const room = db.rooms.find(x => x.id === r.roomId);
-    return {
-      request_id: r.id, type: r.type, room_id: r.roomId,
-      room_name: room ? room.name : null,
-      members: room ? roomMembers(room.id) : [],
-      requested_by: r.requestedBy, created_at: r.createdAt,
-      context: roomContext(r.roomId, 30),
-      decisions: db.decisions.filter(d => d.roomId === r.roomId).map(d => d.text),
-    };
-  });
+  touchBridge(req.bridge);
+  const pending = db.kapioRequests.filter(r => r.status === 'pending' && bridgeSees(req.bridge, r)).map(requestView);
   res.json({ pending });
 });
+// 見張り役用の長ポーリング。依頼が来た瞬間に返る。無ければ timeout 秒で空を返す
+app.get('/api/bridge/wait', bridgeAuth, (req, res) => {
+  const timeoutMs = Math.min(Math.max(Number(req.query.timeout) || 25, 1), 50) * 1000;
+  touchBridge(req.bridge);
+  const ready = takeForWatcher(req.bridge);
+  if (ready.length) return res.json({ pending: ready });
+  const w = { key: callerKey(req.bridge), caller: req.bridge, res, timer: null };
+  w.timer = setTimeout(() => {
+    waiters.delete(w);
+    bridgeSeen.set(w.key, Date.now());
+    if (!res.headersSent) res.json({ pending: [] });
+  }, timeoutMs);
+  waiters.add(w);
+  checkPresence();
+  res.on('close', () => {
+    if (waiters.has(w)) { clearTimeout(w.timer); waiters.delete(w); }
+    bridgeSeen.set(w.key, Date.now());
+  });
+});
+// 考え中表示を続ける（返信まで20秒おき程度に呼ぶ）
+app.post('/api/bridge/typing', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const r = db.kapioRequests.find(x => x.id === (req.body && req.body.request_id));
+  if (!r) return res.status(404).json({ error: 'request not found' });
+  if (!bridgeSees(req.bridge, r)) return res.status(403).json({ error: 'this request belongs to another Muse' });
+  if (r.status !== 'pending') return res.status(409).json({ error: 'already handled', status: r.status });
+  if (!r.pickedAt) { r.pickedAt = now(); save(); }
+  museStatus(r, 'thinking');
+  res.json({ ok: true });
+});
+// 返信。partial:true は「ひと言の先返し」で、同じ依頼の次の返信がその吹き出しを書き換える
 app.post('/api/bridge/reply', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
   const r = db.kapioRequests.find(x => x.id === req.body.request_id);
   if (!r) return res.status(404).json({ error: 'request not found' });
   if (!bridgeSees(req.bridge, r)) return res.status(403).json({ error: 'this request belongs to another Muse' });
-  if (r.status !== 'pending') return res.status(409).json({ error: 'already handled' });
-  const room = db.rooms.find(x => x.id === r.roomId);
+  if (r.status !== 'pending') return res.status(409).json({ error: 'already handled', status: r.status });
+  const room = roomById(r.roomId);
   if (!room) return res.status(404).json({ error: 'room not found' });
-  const body = String(req.body.body || '').trim();
+  const body = String(req.body.body || '').trim().slice(0, 4000);
+  const partial = req.body.partial === true;
   const senderId = r.ownerId ? `muse:${r.ownerId}` : KAPIO_ID;
   const senderName = r.ownerId ? seatName(room) : KAPIO_NAME;
-  if (r.type === 'summary') {
+
+  if (r.type === 'summary' && !partial) {
     room.lastSummary = body || room.lastSummary;
     const decisions = Array.isArray(req.body.decisions) ? req.body.decisions : [];
     for (const text of decisions) {
       const t = String(text).trim().slice(0, 300);
-      if (t) db.decisions.push({ id: id(), roomId: room.id, text: t, createdBy: senderId, createdAt: now() });
+      if (t && !db.decisions.some(d => d.roomId === room.id && d.text === t)) {
+        db.decisions.push({ id: id(), roomId: room.id, text: t, createdBy: senderId, createdAt: now() });
+      }
     }
-    if (body) postMessage(room.id, senderId, senderName, body);
-  } else if (body) {
-    postMessage(room.id, senderId, senderName, body.slice(0, 4000));
   }
-  r.status = 'done';
-  r.handledAt = now();
-  save();
-  res.json({ ok: true });
+  let message = null;
+  const earlier = r.partialMessageId ? db.messages.find(m => m.id === r.partialMessageId && m.type !== 'unsent') : null;
+  if (body && earlier) {
+    earlier.body = body;
+    earlier.editedAt = now();
+    updateMessage(earlier);
+    message = earlier;
+  } else if (body) {
+    message = postMessage(room.id, senderId, senderName, body, 'text', null, { replyTo: r.triggerMessageId });
+  }
+  if (partial) {
+    if (message) r.partialMessageId = message.id;
+    r.pickedAt = now();
+    save();
+    museStatus(r, 'thinking');
+    return res.json({ ok: true, partial: true, message_id: message ? message.id : null });
+  }
+  finishRequest(r, 'done');
+  res.json({ ok: true, message_id: message ? message.id : null });
 });
 app.post('/api/bridge/dismiss', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
   const r = db.kapioRequests.find(x => x.id === req.body.request_id);
   if (!r) return res.status(404).json({ error: 'request not found' });
   if (!bridgeSees(req.bridge, r)) return res.status(403).json({ error: 'this request belongs to another Muse' });
-  r.status = 'done';
-  r.handledAt = now();
-  save();
+  if (r.status === 'pending') finishRequest(r, 'done');
   res.json({ ok: true });
 });
-
-// bridge admin (global bridge only): member/message cleanup
+// bridge admin (global bridge only)
 app.post('/api/bridge/admin/remove-member', bridgeAuth, (req, res) => {
   if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
   const roomId = req.body && req.body.room_id;
   const profileId = req.body && req.body.profile_id;
   db.members = db.members.filter(m => !(m.roomId === roomId && m.profileId === profileId));
-  db.notifications = db.notifications.filter(n => !(n.roomId === roomId && n.profileId === profileId));
   save();
   res.json({ ok: true });
 });
 app.post('/api/bridge/admin/delete-message', bridgeAuth, (req, res) => {
   if (req.bridge.kind !== 'global') return res.status(403).json({ error: 'global bridge only' });
   const messageId = req.body && req.body.message_id;
+  const msg = db.messages.find(m => m.id === messageId);
+  if (!msg) return res.json({ ok: true });
   db.messages = db.messages.filter(m => m.id !== messageId);
-  save();
+  saveRewrite(msg.roomId);
+  broadcastRoom(msg.roomId, { type: 'message_updated', roomId: msg.roomId, message: { id: msg.id, roomId: msg.roomId, deleted: true } });
   res.json({ ok: true });
 });
-
 // app icon (PNG, embedded so install icons work without extra files)
 const ICON_PNG_B64 = [
   'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAPo0lEQVR4nO3cUbLTNhiGYR+mA1ui',
@@ -607,45 +972,87 @@ const ICON_PNG_B64 = [
 app.get('/icon.png', (req, res) => { res.type('png').send(Buffer.from(ICON_PNG_B64, 'base64')); });
 
 // ---------- static / SPA ----------
-app.use(express.static(path.join(ROOT, 'public'), { maxAge: '1h' }));
-app.get('/join/:code', (req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
-app.get('/', (req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
+const noCache = (res) => res.set('Cache-Control', 'no-cache');
+app.use(express.static(path.join(ROOT, 'public'), {
+  maxAge: '1h',
+  setHeaders: (res, p) => { if (p.endsWith('.html') || p.endsWith('sw.js')) noCache(res); },
+}));
+app.get('/join/:code', (req, res) => { noCache(res); res.sendFile(path.join(ROOT, 'public', 'index.html')); });
+app.get('/', (req, res) => { noCache(res); res.sendFile(path.join(ROOT, 'public', 'index.html')); });
 
-// ---------- startup: load remote DB before accepting traffic ----------
+// ---------- startup ----------
 async function start() {
-  const loaded = await Promise.race([remoteLoad(), new Promise(r => setTimeout(() => r(false), 5000))]);
-  if (loaded) console.log('loaded DB from remote store');
+  let how;
+  try {
+    how = await loadDb();
+  } catch (e) {
+    // 読み込めないまま起動すると空のDBで上書きしてしまうため、起動しない
+    console.error('FATAL: could not load data from Upstash. Not starting to avoid overwriting data.', e.message);
+    process.exit(1);
+  }
+  console.log(`data loaded (${how}): ${db.profiles.length} profiles, ${db.rooms.length} rooms, ${db.messages.length} messages`);
+  if (how === 'migrated') { console.log('migrating legacy data to v2 keys'); await flushRemote(); }
+
   const server = app.listen(PORT, () => console.log(`muse-chat listening on ${PORT}`));
 
-// ---------- WS ----------
-const wss = new WebSocketServer({ server, path: '/ws' });
-wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://localhost');
-  const profile = profileByToken(url.searchParams.get('token'));
-  if (!profile) { ws.close(4001, 'unauthorized'); return; }
-  if (!clients.has(profile.id)) clients.set(profile.id, new Set());
-  clients.get(profile.id).add(ws);
-  ws.on('message', (raw) => {
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
-    const room = db.rooms.find(r => r.id === data.roomId);
-    if (!room || !memberOf(room.id, profile.id)) return;
-    if (data.type === 'send') {
-      const body = String(data.body || '').trim().slice(0, 4000);
-      const image = validImage(data.image);
-      if (body || image) postMessage(room.id, profile.id, profile.name, body, image && !body ? 'image' : 'text', image);
-    } else if (data.type === 'callKapio') {
-      if (room.kapioEnabled) queueKapio(room.id, 'reply', profile.id, null);
-    } else if (data.type === 'read') {
-      markRoomRead(room.id, profile.id);
-      save();
-      broadcastRead(room.id, profile.id);
+  const wss = new WebSocketServer({ server, path: '/ws' });
+  wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, 'http://localhost');
+    const profile = profileByToken(url.searchParams.get('token'));
+    if (!profile) { ws.close(4001, 'unauthorized'); return; }
+    if (!clients.has(profile.id)) clients.set(profile.id, new Set());
+    clients.get(profile.id).add(ws);
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('message', (raw) => {
+      let data;
+      try { data = JSON.parse(raw); } catch { return; }
+      const room = roomById(data.roomId);
+      if (!room || !memberOf(room.id, profile.id)) return;
+      if (data.type === 'send') {
+        const body = String(data.body || '').trim().slice(0, 4000);
+        const image = validImage(data.image);
+        if (body || image) postMessage(room.id, profile.id, profile.name, body, image && !body ? 'image' : 'text', image, { replyTo: data.replyTo });
+      } else if (data.type === 'callKapio') {
+        if (room.kapioEnabled) queueKapio(room.id, 'reply', profile.id, null);
+      } else if (data.type === 'read') {
+        markRoomRead(room.id, profile.id);
+        save();
+        broadcastRead(room.id, profile.id);
+      }
+    });
+    ws.on('close', () => {
+      const set = clients.get(profile.id);
+      if (set) { set.delete(ws); if (!set.size) clients.delete(profile.id); }
+    });
+  });
+  // 切れた接続の掃除（スマホのバックグラウンド等）
+  setInterval(() => {
+    for (const ws of wss.clients) {
+      if (!ws.isAlive) { ws.terminate(); continue; }
+      ws.isAlive = false;
+      try { ws.ping(); } catch { /* ignore */ }
     }
-  });
-  ws.on('close', () => {
-    const set = clients.get(profile.id);
-    if (set) { set.delete(ws); if (!set.size) clients.delete(profile.id); }
-  });
-});
+  }, 30000);
+  setInterval(() => { expireRequests(); checkPresence(); }, 15000);
+
+  // デプロイ時などの終了前に、未保存分を書き出す
+  let stopping = false;
+  const shutdown = async (sig) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`${sig} received, flushing data...`);
+    clearTimeout(persist.timer);
+    for (const w of waiters) { clearTimeout(w.timer); if (!w.res.headersSent) w.res.json({ pending: [] }); }
+    for (let i = 0; i < 50 && persist.inflight; i++) await sleep(100);
+    for (let i = 0; i < 3; i++) {
+      try { await flushAll(); } catch (e) { console.error('final flush failed', e); }
+      if (!persist.meta && !persist.appends.length && !persist.rewrite.size) break;
+      await sleep(1000);
+    }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 start();
