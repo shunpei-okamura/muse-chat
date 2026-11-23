@@ -60,7 +60,7 @@
   </header>
   <div id="kapio-bar" class="kapio-bar hidden">
     <span id="kapio-status"></span>
-    <button id="call-kapio-btn" class="sub-btn">カピおを呼ぶ</button>
+    <button id="call-kapio-btn" class="sub-btn">Museを呼ぶ</button>
   </div>
   <div id="message-list" class="message-list"></div>
   <footer class="composer">
@@ -91,8 +91,8 @@
   <div class="modal-card">
     <h2>ルームを作る</h2>
     <label>ルーム名<input id="create-name" type="text" maxlength="50" placeholder="例：週末の予定"></label>
-    <label class="check"><input id="create-kapio" type="checkbox" checked> カピおを同席させる</label>
-    <label>カピおの返信スタイル
+    <label class="check"><input id="create-kapio" type="checkbox" checked> Museの席を用意する</label>
+    <label>Museの返信スタイル
       <select id="create-kapio-mode">
         <option value="mention">「カピお」と呼ばれたときだけ</option>
         <option value="auto">会話を見て自動で口を出す</option>
@@ -119,8 +119,24 @@
       <p class="note">このリンクを友達に送ると、表示名を決めてそのまま参加できます。</p>
     </div>
     <div>メンバー：<span id="settings-members"></span></div>
-    <label class="check"><input id="settings-kapio" type="checkbox"> カピおを同席させる</label>
-    <label>カピおの返信スタイル
+    <div class="summary-box">
+      <h3>Museの同席</h3>
+      <p id="muse-seat-status" class="summary-text"></p>
+      <div id="muse-claim-area">
+        <label>あなたのMuseの名前<input id="muse-name-input" type="text" maxlength="30" placeholder="例：カピお"></label>
+        <button id="muse-claim-btn" class="sub-btn">自分のMuseを同席させる</button>
+        <p class="note">同席させると連携トークンが表示されます。そのトークンをあなたのClaude（Muse）に渡すと、あなたのMuseがこのルームで返信できるようになります。</p>
+      </div>
+      <div id="muse-mine-area" class="hidden">
+        <p class="note">連携トークン（あなたのClaudeに渡してください）</p>
+        <div class="invite-link-row">
+          <input id="muse-token-input" type="text" readonly>
+          <button id="muse-token-copy" class="sub-btn">コピー</button>
+        </div>
+        <button id="muse-release-btn" class="sub-btn">同席をやめる</button>
+      </div>
+    </div>
+    <label>Museの返信スタイル
       <select id="settings-kapio-mode">
         <option value="mention">「カピお」と呼ばれたときだけ</option>
         <option value="auto">会話を見て自動で口を出す</option>
@@ -128,7 +144,7 @@
     </label>
     <div class="summary-box">
       <h3>最新の要約</h3>
-      <p id="settings-summary" class="summary-text">まだ要約はありません。「📋 会話を要約」を押すとカピおが作ります。</p>
+      <p id="settings-summary" class="summary-text">まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。</p>
       <h3>決まったこと・約束</h3>
       <ul id="decision-list" class="decision-list"></ul>
       <div class="join-box">
