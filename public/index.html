@@ -7,6 +7,10 @@
 <meta name="theme-color" content="#06c755">
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="mobile-web-app-capable" content="yes">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -20,7 +24,7 @@
     <p id="join-notice" class="join-notice hidden"></p>
     <input id="setup-name" type="text" maxlength="30" placeholder="表示名（例：しゅんぺい）" autocomplete="name">
     <button id="setup-btn" class="primary-btn">はじめる</button>
-    <p class="note">※ ブラウザを閉じている間のプッシュ通知は未対応です。開いている間は通知します。</p>
+    <p class="note">※ ホーム画面に追加して通知を許可すると、アプリを閉じている間もプッシュ通知が届きます（iPhoneはホーム画面に追加が必須です）。</p>
   </div>
 </section>
 
@@ -76,7 +80,7 @@
   </header>
   <div class="notif-actions">
     <button id="enable-notif-btn" class="sub-btn">ブラウザ通知を許可する</button>
-    <p class="note">通知はこのページを開いている間だけ届きます。閉じている間のプッシュ通知は未対応で、次に開いたときにここで確認できます。</p>
+    <p class="note">通知を許可すると、開いている間は画面に、閉じている間はプッシュで届きます（iPhoneはホーム画面に追加したアプリから許可してください）。</p>
   </div>
   <ul id="notification-list" class="notification-list"></ul>
   <p id="notif-empty" class="empty hidden">通知はありません。</p>
