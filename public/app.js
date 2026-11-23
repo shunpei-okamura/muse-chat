@@ -196,24 +196,32 @@ const PRESENCE_LABEL = {
 };
 function renderMuseBar() {
   if (!currentRoom) return;
-  const seat = currentRoom.museSeat || { active: currentRoom.kapioEnabled, name: 'Muse', presence: 'offline' };
-  $('#kapio-bar').classList.toggle('hidden', !seat.active);
-  if (!seat.active) return;
-  const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : `「${seat.name}」と呼ぶと返信`;
-  const p = PRESENCE_LABEL[seat.presence] || PRESENCE_LABEL.offline;
-  $('#kapio-status').innerHTML = `🍸 ${esc(seat.name)}（Muse）同席中・${esc(how)}<br><span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span>`;
-  $('#call-kapio-btn').textContent = `${seat.name}を呼ぶ`;
+  const seats = currentRoom.muses || [];
+  $('#kapio-bar').classList.toggle('hidden', !seats.length);
+  if (!seats.length) return;
+  const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : '名前を呼ばれたときだけ返信';
+  $('#kapio-status').innerHTML = seats.map(s => {
+    const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
+    return `<span class="seat-line">🍸 ${esc(s.name)}（Muse）同席中<span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></span>`;
+  }).join('') + `<span class="seat-how">${esc(how)}</span>`;
+  const old = $('#call-kapio-btn');
+  if (old) old.classList.add('hidden');
+  document.querySelectorAll('.call-seat-btn').forEach(b => b.addEventListener('click', async () => {
+    if (!currentRoom) return;
+    try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST', body: JSON.stringify({ seatId: b.dataset.seat }) }); }
+    catch (e) { alert(e.message); }
+  }));
 }
 function renderMuseActivity() {
   clearTimeout(activityHideTimer);
   if (!currentRoom) { museActivity.classList.add('hidden'); return; }
-  const name = currentRoom.museSeat?.name || 'Muse';
-  const presence = currentRoom.museSeat?.presence || 'offline';
   const states = [...activeRequests.values()];
   if (!states.length) { museActivity.classList.add('hidden'); return; }
   const thinking = states.find(s => s.state === 'thinking');
   const called = states.find(s => s.state === 'called');
   const expired = states.find(s => s.state === 'expired');
+  const name = (thinking || called || expired)?.name || 'Muse';
+  const presence = (thinking || called || expired)?.presence || 'offline';
   let text = '';
   let busy = false;
   if (thinking) {
@@ -232,9 +240,12 @@ function renderMuseActivity() {
 }
 function handleMuseStatus(data) {
   if (!currentRoom || data.roomId !== currentRoom.id) return;
-  if (data.presence && currentRoom.museSeat) { currentRoom.museSeat.presence = data.presence; renderMuseBar(); }
+  if (data.presence && Array.isArray(currentRoom.muses) && data.seatId) {
+    const s = currentRoom.muses.find(x => x.seatId === data.seatId);
+    if (s) { s.presence = data.presence; renderMuseBar(); }
+  }
   if (data.state === 'done') activeRequests.delete(data.requestId);
-  else activeRequests.set(data.requestId, { state: data.state, type: data.requestType });
+  else activeRequests.set(data.requestId, { state: data.state, type: data.requestType, name: data.name, presence: data.presence });
   renderMuseActivity();
 }
 
@@ -243,7 +254,7 @@ async function openRoom(roomId) {
   const detail = await api(`/api/rooms/${roomId}`);
   currentRoom = detail;
   $('#chat-title').textContent = detail.name;
-  activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type }]));
+  activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -382,7 +393,7 @@ async function syncMissed() {
     ]);
     if (!currentRoom || currentRoom.id !== roomId) return;
     currentRoom = detail;
-    activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type }]));
+    activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
     renderMuseBar();
     renderMuseActivity();
     for (const m of msgs) appendMessage(m);
@@ -391,7 +402,6 @@ async function syncMissed() {
     if (document.visibilityState === 'visible') api(`/api/rooms/${roomId}/read`, { method: 'POST' }).catch(() => {});
   } catch { /* retry on next reconnect */ }
 }
-
 // ---------- long press menu (copy / unsend) ----------
 const sheet = document.createElement('div');
 sheet.className = 'sheet hidden';
@@ -426,7 +436,7 @@ sheet.addEventListener('click', async (e) => {
   } else if (act === 'copy') {
     try { await navigator.clipboard.writeText(m.body); } catch { /* ignore */ }
   } else if (act === 'unsend') {
-    const museHere = !!currentRoom?.museSeat?.active;
+    const museHere = (currentRoom?.muses || []).length > 0;
     const note = museHere ? '\nMuseがすでに読んでいた場合、Muse側の記憶からは消せません。' : '';
     if (!confirm(`送信を取り消しますか？\n全員の画面から消えます。${note}`)) return;
     try {
@@ -624,17 +634,15 @@ $('#room-settings-btn').addEventListener('click', async () => {
   $('#settings-code').textContent = detail.inviteCode;
   $('#settings-link').value = `${location.origin}/join/${detail.inviteCode}`;
   $('#settings-members').textContent = detail.members.map(m => m.name).join('、');
-  const seat = detail.museSeat || { active: detail.kapioEnabled, name: 'カピお', ownerId: null, ownerName: null };
-  $('#muse-seat-status').textContent = !seat.active
+  const seats = detail.muses || [];
+  $('#muse-seat-status').textContent = !seats.length
     ? 'Museは同席していません'
-    : seat.ownerId
-      ? `${seat.name}（${seat.ownerName || ''}さんのMuse）が同席中です`
-      : `${seat.name}が同席中です`;
-  const mine = !!seat.ownerId && seat.ownerId === profile.id;
+    : seats.map(s => s.ownerId ? `${s.name}（${s.ownerName || ''}さんのMuse）` : s.name).join('、') + ' が同席中です';
+  const mine = seats.find(s => s.ownerId === profile.id);
   $('#muse-mine-area').classList.toggle('hidden', !mine);
-  $('#muse-claim-area').classList.toggle('hidden', mine);
+  $('#muse-claim-area').classList.toggle('hidden', !!mine);
   if (mine) {
-    try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; } catch { /* ignore */ }
+    try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; $('#muse-prompt').value = buildBridgePrompt(t.bridgeToken); } catch { /* ignore */ }
   }
   $('#settings-kapio-mode').value = detail.kapioMode;
   $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。';
@@ -686,7 +694,7 @@ $('#muse-claim-btn').addEventListener('click', async () => {
   const name = $('#muse-name-input').value.trim();
   try {
     await api(`/api/rooms/${currentRoom.id}/muse-claim`, { method: 'POST', body: JSON.stringify({ name }) });
-    alert('あなたのMuseが同席するようになりました。設定に表示される連携トークンを、あなたのClaude（Muse）に渡してください。');
+    alert('あなたのMuseが同席するようになりました。設定に表示される「Museへの指示文」をコピーして、あなたのMuseに貼り付けてください。');
     $('#room-settings-btn').click();
     reloadCurrentRoom();
   } catch (e) { alert(e.message); }
@@ -705,6 +713,45 @@ $('#muse-token-copy').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(input.value); alert('連携トークンをコピーしました'); }
   catch { document.execCommand('copy'); alert('連携トークンをコピーしました'); }
 });
+$('#muse-prompt-copy').addEventListener('click', async () => {
+  const input = $('#muse-prompt');
+  input.select();
+  try { await navigator.clipboard.writeText(input.value); alert('Museへの指示文をコピーしました'); }
+  catch { document.execCommand('copy'); alert('Museへの指示文をコピーしました'); }
+});
+// 自分のMuseにそのまま貼れる指示文（トークン・URL・自分の席の名前入り）
+function buildBridgePrompt(token) {
+  const seat = (currentRoom?.muses || []).find(s => s.ownerId === profile.id);
+  const museName = seat ? seat.name : 'Muse';
+  const roomName = currentRoom ? currentRoom.name : '';
+  const origin = location.origin;
+  return `あなたはチャットアプリ「Muse対応チャット」のルーム「${roomName}」に、${museName}（${profile.name}さんのMuse）として同席します。人間と同じように会話に参加し、呼ばれたら返信してください。
+
+【接続情報】
+連携トークン: ${token}
+APIのベースURL: ${origin}
+
+【見張り方（即時返信のために必須）】
+GET ${origin}/api/bridge/wait?timeout=25
+ヘッダー: Authorization: Bearer ${token}
+依頼が来ると即座に pending が返ります。空で返ったら、間を空けずに同じリクエストを繰り返し続けてください（これで「在席」になり、呼ばれてから数秒で返信できます）。長ポーリングを維持できない環境では、GET ${origin}/api/bridge/pending を短い間隔で確認してください。
+
+【依頼の形式】
+各依頼: request_id / type（reply=返信、summary=要約）/ room_name / muse_name（あなたの名前）/ trigger（きっかけの発言）/ context（直近の会話）/ decisions / summary。有効期限は30分です。
+
+【返信のしかた】
+POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、Content-Type: application/json）
+本文: {"request_id": "依頼のID", "body": "返信文"}
+・時間がかかる返信は、先に {"request_id": "...", "body": "ひと言", "partial": true} を送ると吹き出しが先に出て、完成版を partial なしで送ると書き換わります。
+・考えている間は POST ${origin}/api/bridge/typing {"request_id": "..."} を20秒おきに呼ぶと「考え中」と表示されます。
+・返信が不要な依頼は POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じてください。
+・type が summary の依頼では body に要約を入れ、決まったことがあれば decisions（文字列の配列）も付けてください。
+
+【注意】
+・このトークンはあなたの席専用です。他人に教えないでください。
+・発言は「${museName}」の名前で投稿されます。
+・流れに合わない呼びかけには無理に返さず dismiss して構いません。`;
+}
 $('#settings-save').addEventListener('click', async (e) => {
   if (!currentRoom) return;
   try {
@@ -795,10 +842,9 @@ function connectWs() {
     } else if (data.type === 'muse_status') {
       handleMuseStatus(data);
     } else if (data.type === 'muse_presence') {
-      if (currentRoom && data.roomId === currentRoom.id && currentRoom.museSeat) {
-        currentRoom.museSeat.presence = data.presence;
-        renderMuseBar();
-        renderMuseActivity();
+      if (currentRoom && data.roomId === currentRoom.id && Array.isArray(currentRoom.muses)) {
+        const s = currentRoom.muses.find(x => x.seatId === data.seatId);
+        if (s) { s.presence = data.presence; renderMuseBar(); }
       }
     } else if (data.type === 'notification') {
       refreshBell();
