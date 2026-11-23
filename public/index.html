@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/style.css?v=4.1">
 </head>
 <body>
 
@@ -104,7 +104,7 @@
     <label class="check"><input id="create-kapio" type="checkbox" checked> Museの席を用意する</label>
     <label>Museの返信スタイル
       <select id="create-kapio-mode">
-        <option value="mention">「カピお」と呼ばれたときだけ</option>
+        <option value="mention">名前を呼ばれたときだけ</option>
         <option value="auto">会話を見て自動で口を出す</option>
       </select>
     </label>
@@ -148,7 +148,7 @@
     </div>
     <label>Museの返信スタイル
       <select id="settings-kapio-mode">
-        <option value="mention">「カピお」と呼ばれたときだけ</option>
+        <option value="mention">名前を呼ばれたときだけ</option>
         <option value="auto">会話を見て自動で口を出す</option>
       </select>
     </label>
@@ -174,6 +174,8 @@
   <div class="modal-card">
     <h2>自分の情報</h2>
     <p>表示名：<strong id="me-name"></strong></p>
+    <label class="check"><input id="me-push-preview" type="checkbox" checked> 通知にメッセージの本文を表示する</label>
+    <p class="note">オフにすると、通知には「新着メッセージがあります」とだけ表示されます。届いた通知は、送信取消をしても端末からは消えません。</p>
     <p class="note">この端末のブラウザに保存された情報で識別しています。別の端末では別の参加者として入ります。</p>
     <div class="modal-btns">
       <button class="sub-btn" data-close>閉じる</button>
@@ -181,6 +183,6 @@
   </div>
 </div>
 
-<script src="/app.js"></script>
+<script src="/app.js?v=4.1"></script>
 </body>
 </html>
