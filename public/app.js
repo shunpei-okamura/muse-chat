@@ -94,7 +94,7 @@ async function loadRooms() {
     const li = document.createElement('li');
     li.className = 'room-item';
     const others = r.members.filter(m => m.id !== profile.id);
-    const color = others.length === 1 && others[0].isKapio ? '#2d3436' : (others[0]?.color || '#06c755');
+    const color = others.length === 1 && (others[0].isMuse || others[0].isKapio) ? '#d4a017' : (others[0]?.color || '#06c755');
     const initial = r.name.slice(0, 1) || 'ル';
     li.innerHTML = `
       <div class="avatar" style="background:${esc(color)}">${esc(initial)}</div>
@@ -140,9 +140,11 @@ async function openRoom(roomId) {
   const detail = await api(`/api/rooms/${roomId}`);
   currentRoom = detail;
   $('#chat-title').textContent = detail.name;
-  $('#kapio-bar').classList.toggle('hidden', !detail.kapioEnabled);
-  if (detail.kapioEnabled) {
-    $('#kapio-status').textContent = detail.kapioMode === 'auto' ? '🍸 カピお同席中（自動で口を出します）' : '🍸 カピお同席中（「カピお」と呼ぶと返信）';
+  const seat = detail.museSeat || { active: detail.kapioEnabled, name: 'カピお' };
+  $('#kapio-bar').classList.toggle('hidden', !seat.active);
+  if (seat.active) {
+    $('#kapio-status').textContent = detail.kapioMode === 'auto' ? `🍸 ${seat.name}（Muse）同席中（自動で口を出します）` : `🍸 ${seat.name}（Muse）同席中（「${seat.name}」と呼ぶと返信）`;
+    $('#call-kapio-btn').textContent = `${seat.name}を呼ぶ`;
   }
   const msgs = await api(`/api/rooms/${roomId}/messages`);
   const list = $('#message-list');
@@ -163,14 +165,14 @@ function appendMessage(m) {
     return;
   }
   const isMe = m.senderId === profile.id;
-  const isKapio = m.senderId === 'kapio';
+  const isKapio = m.senderId === 'kapio' || String(m.senderId || '').startsWith('muse:');
   const member = currentRoom?.members.find(x => x.id === m.senderId);
   const row = document.createElement('div');
   row.className = 'msg-row' + (isMe ? ' me' : '') + (isKapio ? ' kapio' : '');
   row.innerHTML = `
     ${isMe ? '' : `<div class="avatar" style="background:${esc(member?.color || '#888')}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
-      ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（AI）' : ''}</div>`}
+      ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? '（Muse）' : ''}</div>`}
       <div class="msg-bubble">${esc(m.body)}</div>
       <div class="msg-time">${fmtTime(m.createdAt)}</div>
     </div>`;
@@ -201,15 +203,15 @@ $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   try {
     await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' });
-    alert('カピおを呼びました。少し待つと返信が来ます。');
+    alert(`${currentRoom.museSeat?.name || 'Muse'}を呼びました。少し待つと返信が来ます。`);
   } catch (e) { alert(e.message); }
 });
 $('#summary-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
-  if (!currentRoom.kapioEnabled) { alert('このルームにはカピおが同席していません'); return; }
+  if (!currentRoom.kapioEnabled) { alert('このルームにはMuseが同席していません'); return; }
   try {
     await api(`/api/rooms/${currentRoom.id}/summary-request`, { method: 'POST' });
-    alert('カピおに要約を頼みました。できたらこのルームに投稿されます。');
+    alert('Museに要約を頼みました。できたらこのルームに投稿されます。');
   } catch (e) { alert(e.message); }
 });
 
@@ -222,7 +224,18 @@ $('#room-settings-btn').addEventListener('click', async () => {
   $('#settings-code').textContent = detail.inviteCode;
   $('#settings-link').value = `${location.origin}/join/${detail.inviteCode}`;
   $('#settings-members').textContent = detail.members.map(m => m.name).join('、');
-  $('#settings-kapio').checked = detail.kapioEnabled;
+  const seat = detail.museSeat || { active: detail.kapioEnabled, name: 'カピお', ownerId: null, ownerName: null };
+  $('#muse-seat-status').textContent = !seat.active
+    ? 'Museは同席していません'
+    : seat.ownerId
+      ? `${seat.name}（${seat.ownerName || ''}さんのMuse）が同席中です`
+      : `${seat.name}が同席中です`;
+  const mine = !!seat.ownerId && seat.ownerId === profile.id;
+  $('#muse-mine-area').classList.toggle('hidden', !mine);
+  $('#muse-claim-area').classList.toggle('hidden', mine);
+  if (mine) {
+    try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; } catch { /* ignore */ }
+  }
   $('#settings-kapio-mode').value = detail.kapioMode;
   $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとカピおが作ります。';
   renderDecisions(detail.decisions || []);
@@ -258,11 +271,38 @@ $('#copy-link-btn').addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(input.value); alert('招待リンクをコピーしました'); }
   catch { document.execCommand('copy'); alert('招待リンクをコピーしました'); }
 });
+$('#muse-claim-btn').addEventListener('click', async () => {
+  if (!currentRoom) return;
+  const name = $('#muse-name-input').value.trim();
+  try {
+    await api(`/api/rooms/${currentRoom.id}/muse-claim`, { method: 'POST', body: JSON.stringify({ name }) });
+    alert('あなたのMuseが同席するようになりました。設定に表示される連携トークンを、あなたのClaude（Muse）に渡してください。');
+    $('#room-settings-btn').click();
+    const msgs = await api(`/api/rooms/${currentRoom.id}/messages`);
+    const list = $('#message-list');
+    list.innerHTML = '';
+    for (const m of msgs) appendMessage(m);
+    scrollChat();
+  } catch (e) { alert(e.message); }
+});
+$('#muse-release-btn').addEventListener('click', async () => {
+  if (!currentRoom) return;
+  try {
+    await api(`/api/rooms/${currentRoom.id}/muse-release`, { method: 'POST', body: '{}' });
+    $('#room-settings-btn').click();
+  } catch (e) { alert(e.message); }
+});
+$('#muse-token-copy').addEventListener('click', async () => {
+  const input = $('#muse-token-input');
+  input.select();
+  try { await navigator.clipboard.writeText(input.value); alert('連携トークンをコピーしました'); }
+  catch { document.execCommand('copy'); alert('連携トークンをコピーしました'); }
+});
 $('#settings-save').addEventListener('click', async (e) => {
   if (!currentRoom) return;
   const updated = await api(`/api/rooms/${currentRoom.id}/settings`, {
     method: 'POST',
-    body: JSON.stringify({ name: $('#settings-name').value.trim(), kapioEnabled: $('#settings-kapio').checked, kapioMode: $('#settings-kapio-mode').value }),
+    body: JSON.stringify({ name: $('#settings-name').value.trim(), kapioMode: $('#settings-kapio-mode').value }),
   });
   currentRoom = { ...currentRoom, ...updated };
   $('#chat-title').textContent = updated.name;
