@@ -1,0 +1,13 @@
+{
+  "name": "muse-bell",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Muse対応チャットの呼び鈴（Cloudflare Worker + Durable Object）",
+  "scripts": {
+    "dev": "wrangler dev --local --port 8787",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.159.0"
+  }
+}

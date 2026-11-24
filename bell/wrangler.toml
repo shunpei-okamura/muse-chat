@@ -1,0 +1,13 @@
+# Muse対応チャットの呼び鈴（v4.15）
+# 秘密鍵 BELL_SECRET は `wrangler secret put BELL_SECRET` で設定する（このファイルには書かない）
+name = "muse-bell"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[[durable_objects.bindings]]
+name = "BELL"
+class_name = "Bell"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Bell"]
