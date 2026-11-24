@@ -118,6 +118,11 @@ input, textarea, select { font: inherit; padding: 10px; border: 1px solid #ccc; 
 .ua-item { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0 2px 10px; }
 .ua-about { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ua-meta { flex-shrink: 0; color: #a08c2a; font-size: 12px; }
+.ua-unjudged-head { font-weight: 600; margin: 4px 0 2px; opacity: .55; }
+.ua-dim { opacity: .55; }
+.ua-tappable { cursor: pointer; }
+.ua-highlight { animation: ua-flash 2s ease; }
+@keyframes ua-flash { 0%, 60% { background: #ffe9a8; } 100% { background: transparent; } }
 .muse-activity .dots { display: inline-flex; gap: 3px; }
 .muse-activity .dots i { width: 5px; height: 5px; border-radius: 50%; background: #d4a017; animation: muse-dot 1.2s infinite ease-in-out; }
 .muse-activity .dots i:nth-child(2) { animation-delay: .2s; }

@@ -237,11 +237,14 @@ function renderMuseBar() {
 $('#kapio-summary').addEventListener('click', () => { kapioBarOpen = !kapioBarOpen; renderMuseBar(); });
 function renderMuseActivity() {
   // v4.16: 「考え中」表示はやめ、席ごとの未回答件数をオーナー名で出す。全席0件ならバー自体を出さない
+  // v4.17: 件数は「要回答」と判定されたものだけ。判定前がある間はバー自体は出し、末尾に判定前の件数も添える
   if (!currentRoom) { museActivity.classList.add('hidden'); renderMuseUnansweredPanel(); return; }
-  const counts = (unansweredCounts || []).filter(c => c.count > 0);
-  if (!counts.length) { museActivity.classList.add('hidden'); renderMuseUnansweredPanel(); return; }
-  const text = counts.map(c => `${c.ownerName || c.name || 'Muse'} 未回答${c.count}件`).join('、');
-  museActivity.innerHTML = `<span>${esc(text)}</span>`;
+  const groups = (unansweredCounts || []).filter(c => c.count > 0);
+  const unjudgedTotal = (unansweredCounts || []).reduce((n, c) => n + (c.unjudgedCount || 0), 0);
+  if (!groups.length && !unjudgedTotal) { museActivity.classList.add('hidden'); renderMuseUnansweredPanel(); return; }
+  const parts = groups.map(c => `${c.ownerName || c.name || 'Muse'} 未回答${c.count}件`);
+  if (unjudgedTotal) parts.push(`判定前${unjudgedTotal}件`);
+  museActivity.innerHTML = `<span>${esc(parts.join('、'))}</span>`;
   museActivity.classList.remove('hidden');
   renderMuseUnansweredPanel();
 }
@@ -251,19 +254,29 @@ function uaTime(iso) {
   return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString('ja-JP', { hour: 'numeric', minute: '2-digit' })}`;
 }
 function renderMuseUnansweredPanel() {
-  const groups = (unansweredList || []).filter(g => g.count > 0);
+  const groups = (unansweredList || []).filter(g => g.count > 0 || (g.unjudged || []).length);
   if (!unansweredPanelOpen || !currentRoom || !groups.length) {
     museUnansweredPanel.classList.add('hidden');
     if (!groups.length) unansweredPanelOpen = false;
     return;
   }
+  const itemHtml = (r, dim) => `<div class="ua-item${dim ? ' ua-dim' : ''}${r.triggerMessageId ? ' ua-tappable' : ''}"${r.triggerMessageId ? ` data-trigger="${esc(r.triggerMessageId)}"` : ''}><span class="ua-about">${esc(r.title || r.about || '')}</span><span class="ua-meta">${r.fromName ? `${esc(r.fromName)} から ・ ` : ''}${esc(uaTime(r.createdAt))}</span></div>`;
   museUnansweredPanel.innerHTML = groups.map(g => `
     <div class="ua-group">
-      <div class="ua-group-head">${esc(g.ownerName || g.name || 'Muse')} 未回答${g.count}件</div>
-      ${(g.requests || []).map(r => `<div class="ua-item"><span class="ua-about">${esc(r.about || '')}</span><span class="ua-meta">${r.fromName ? `${esc(r.fromName)} から ・ ` : ''}${esc(uaTime(r.createdAt))}</span></div>`).join('')}
+      ${g.count ? `<div class="ua-group-head">${esc(g.ownerName || g.name || 'Muse')} 未回答${g.count}件</div>` + (g.requests || []).map(r => itemHtml(r, false)).join('') : ''}
+      ${(g.unjudged || []).length ? `<div class="ua-unjudged-head">${esc(g.ownerName || g.name || 'Muse')} ・ 判定前${(g.unjudged || []).length}件</div>` + (g.unjudged || []).map(r => itemHtml(r, true)).join('') : ''}
     </div>`).join('');
   museUnansweredPanel.classList.remove('hidden');
 }
+museUnansweredPanel.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-trigger]');
+  if (!el) return;
+  const target = document.querySelector(`[data-msg-id="${el.dataset.trigger}"]`);
+  if (!target) return;
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  target.classList.add('ua-highlight');
+  setTimeout(() => target.classList.remove('ua-highlight'), 2000);
+});
 museActivity.addEventListener('click', () => { unansweredPanelOpen = !unansweredPanelOpen; renderMuseUnansweredPanel(); });
 function handleMuseUnanswered(data) {
   if (!currentRoom || data.roomId !== currentRoom.id) return;
@@ -833,6 +846,12 @@ APIのベースURL: ${origin}
 分類G（全体宛の相談: type=group）: 特定の誰か宛ではなく全体への相談（日程調整など）。ルームへ即答も仮答もしない。オーナーに取り次ぐ: 連絡スペースに質問として登録し、オーナーに普段のチャットでも知らせる。オーナーの回答が得られたら、それをもとに reply で送る（例:「○日と○日なら空いてるよ」）。回答が得られなければ送らない。日程の確定や約束はしない（都合の集計まで）。
 
 分類C（返さない）: 関係が薄い、既に他の人が答えた、話題が流れた。dismiss で閉じる。迷ったらBに倒す。
+
+【未回答の判定登録（verdict）: 分類したら必ず登録する】
+アプリの「未回答」表示（件数と一覧）は、この判定で決まります。依頼を分類したら、POST ${origin}/api/bridge/verdict（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "needs_answer": true/false, "title": "題名"}）で登録してください。再登録で上書きできます（分類が変わったら登録し直す）。
+- needs_answer=true（分類B・Q・G: オーナーの承認・回答が要るもの）: title に内容が分かる題名を付ける（例:「クリスマスパーティーの日程について」）。一覧ではこの題名が主表示になります。
+- needs_answer=false（分類A: 自分で回答済み／分類C: 回答不要）: title は不要です。要回答でないものは未回答表示に出ません。
+判定を付けていない依頼は「判定前」として一覧に薄く出ます（取りこぼし防止のため）。処理の最後に判定まで済ませてください。
 
 【ループ防止（Aの前に必ず確認。contextの直近発言で判定）】
 1. 自席の発言が2回続いている（間に人間の発言がない）→ 自動返信しない（Cにする）。
