@@ -219,7 +219,7 @@ function addNotice(m) {
 }
 function renderNotices() {
   const btn = $('#notices-btn');
-  if (btn) btn.textContent = roomNotices.length ? `🔔${roomNotices.length}` : '🔔';
+  if (btn) btn.textContent = roomNotices.length ? `🆕${roomNotices.length}` : '🆕';
   if (!noticesPanelOpen || !roomNotices.length) {
     noticesPanel.classList.add('hidden');
     if (!roomNotices.length) noticesPanelOpen = false;
@@ -441,6 +441,13 @@ function replaceMessage(m) {
   const list = $('#message-list');
   const old = list.querySelector(`[data-msg-id="${CSS.escape(m.id)}"]`);
   const idx = chatMessages.findIndex(x => x.id === m.id);
+  if (m.type === 'notice') {
+    // v4.21: お知らせへ移された発言はトーク欄から外す
+    if (old) old.remove();
+    if (idx >= 0) chatMessages.splice(idx, 1);
+    addNotice(m);
+    return;
+  }
   if (m.deleted) {
     if (old) old.remove();
     if (idx >= 0) chatMessages.splice(idx, 1);
