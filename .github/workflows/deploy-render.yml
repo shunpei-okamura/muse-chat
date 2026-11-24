@@ -1,0 +1,19 @@
+# Render のアプリを自動で反映する（Render の Deploy Hook を呼ぶだけ）
+# server.js・package.json・public/ が main に入った時、または手動実行で動く
+# 必要な GitHub Secret: RENDER_DEPLOY_HOOK（Render の Settings → Deploy Hook の URL）
+name: deploy-render
+on:
+  push:
+    branches: [main]
+    paths: ['server.js', 'package.json', 'public/**']
+  workflow_dispatch:
+concurrency: deploy-render
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: call Render deploy hook
+        run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK" > /dev/null && echo "deploy requested"
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
