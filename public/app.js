@@ -268,10 +268,25 @@ function renderMuseUnansweredPanel() {
     </div>`).join('');
   museUnansweredPanel.classList.remove('hidden');
 }
-museUnansweredPanel.addEventListener('click', (e) => {
+museUnansweredPanel.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-trigger]');
-  if (!el) return;
-  const target = document.querySelector(`[data-msg-id="${el.dataset.trigger}"]`);
+  if (!el || !currentRoom) return;
+  const msgId = el.dataset.trigger;
+  let target = document.querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
+  if (!target) {
+    // 初期表示は最新100件だけなので、古い発言は過去分を遡って読み込んでから探す（v4.19）
+    for (let i = 0; i < 10 && !target; i++) {
+      const oldest = chatMessages.reduce((a, m) => Math.min(a, m.seq || Infinity), Infinity);
+      if (!isFinite(oldest)) break;
+      const older = await api(`/api/rooms/${currentRoom.id}/messages?before=${oldest}`).catch(() => null);
+      if (!older || !older.length) break;
+      const known = new Set(chatMessages.map(m => m.id));
+      const fresh = older.filter(m => !known.has(m.id));
+      if (!fresh.length) break;
+      renderAllMessages([...fresh, ...chatMessages].sort((a, b) => (a.seq || 0) - (b.seq || 0)));
+      target = document.querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
+    }
+  }
   if (!target) return;
   target.scrollIntoView({ behavior: 'smooth', block: 'center' });
   target.classList.add('ua-highlight');
