@@ -197,9 +197,14 @@ $('#me-push-preview').addEventListener('change', async (e) => {
 const museActivity = document.createElement('div');
 museActivity.className = 'muse-activity hidden';
 $('#view-chat').insertBefore(museActivity, $('#image-preview'));
+const museUnansweredPanel = document.createElement('div');
+museUnansweredPanel.className = 'muse-unanswered-panel hidden';
+$('#view-chat').insertBefore(museUnansweredPanel, $('#image-preview'));
 let activeRequests = new Map(); // requestId -> { state, type }
 let activityHideTimer = null;
 let unansweredCounts = []; // v4.16: 席ごとの未回答件数 [{ seatId, ownerName, name, count }]
+let unansweredList = []; // v4.16: 未回答一覧（席ごと・依頼つき）
+let unansweredPanelOpen = false;
 
 const PRESENCE_LABEL = {
   live: { dot: 'live', text: 'すぐ返信できます' },
@@ -232,16 +237,38 @@ function renderMuseBar() {
 $('#kapio-summary').addEventListener('click', () => { kapioBarOpen = !kapioBarOpen; renderMuseBar(); });
 function renderMuseActivity() {
   // v4.16: 「考え中」表示はやめ、席ごとの未回答件数をオーナー名で出す。全席0件ならバー自体を出さない
-  if (!currentRoom) { museActivity.classList.add('hidden'); return; }
+  if (!currentRoom) { museActivity.classList.add('hidden'); renderMuseUnansweredPanel(); return; }
   const counts = (unansweredCounts || []).filter(c => c.count > 0);
-  if (!counts.length) { museActivity.classList.add('hidden'); return; }
+  if (!counts.length) { museActivity.classList.add('hidden'); renderMuseUnansweredPanel(); return; }
   const text = counts.map(c => `${c.ownerName || c.name || 'Muse'} 未回答${c.count}件`).join('、');
   museActivity.innerHTML = `<span>${esc(text)}</span>`;
   museActivity.classList.remove('hidden');
+  renderMuseUnansweredPanel();
 }
+function uaTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString('ja-JP', { hour: 'numeric', minute: '2-digit' })}`;
+}
+function renderMuseUnansweredPanel() {
+  const groups = (unansweredList || []).filter(g => g.count > 0);
+  if (!unansweredPanelOpen || !currentRoom || !groups.length) {
+    museUnansweredPanel.classList.add('hidden');
+    if (!groups.length) unansweredPanelOpen = false;
+    return;
+  }
+  museUnansweredPanel.innerHTML = groups.map(g => `
+    <div class="ua-group">
+      <div class="ua-group-head">${esc(g.ownerName || g.name || 'Muse')} 未回答${g.count}件</div>
+      ${(g.requests || []).map(r => `<div class="ua-item"><span class="ua-about">${esc(r.about || '')}</span><span class="ua-meta">${r.fromName ? `${esc(r.fromName)} から ・ ` : ''}${esc(uaTime(r.createdAt))}</span></div>`).join('')}
+    </div>`).join('');
+  museUnansweredPanel.classList.remove('hidden');
+}
+museActivity.addEventListener('click', () => { unansweredPanelOpen = !unansweredPanelOpen; renderMuseUnansweredPanel(); });
 function handleMuseUnanswered(data) {
   if (!currentRoom || data.roomId !== currentRoom.id) return;
   unansweredCounts = Array.isArray(data.counts) ? data.counts : [];
+  if (Array.isArray(data.list)) unansweredList = data.list;
   renderMuseActivity();
 }
 function handleMuseStatus(data) {
@@ -262,6 +289,7 @@ async function openRoom(roomId) {
   $('#chat-title').textContent = detail.name;
   activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
   unansweredCounts = detail.museUnanswered || [];
+  unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -403,6 +431,7 @@ async function syncMissed() {
     currentRoom = detail;
     activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
     unansweredCounts = detail.museUnanswered || [];
+  unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
     renderMuseBar();
     renderMuseActivity();
     for (const m of msgs) appendMessage(m);
@@ -621,7 +650,7 @@ $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
 });
 $('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; saveDraft(); });
-$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); unansweredCounts = []; renderMuseActivity(); show('#view-rooms'); loadRooms(); });
+$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); unansweredCounts = []; unansweredList = []; unansweredPanelOpen = false; renderMuseActivity(); show('#view-rooms'); loadRooms(); });
 $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
