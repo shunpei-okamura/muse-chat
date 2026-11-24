@@ -385,6 +385,7 @@ function roomDetail(room, profileId) {
       .filter(r => r.roomId === room.id && r.status === 'pending')
       .map(r => ({ requestId: r.id, type: r.type, state: r.pickedAt ? 'thinking' : 'called', seatId: r.ownerId ? `muse:${r.ownerId}` : KAPIO_ID, name: seatNameFor(room, r.ownerId) })),
     museUnanswered: unansweredCounts(room),
+    museUnansweredList: unansweredList(room),
   };
 }
 // 自分の発言、または自分のMuseの発言なら取り消せる
@@ -545,19 +546,35 @@ function museStatus(r, state) {
     presence: bridgePresence(r.ownerId || 'global'),
   });
 }
-// v4.16: 席ごとの未回答件数（「考え中」表示の代わりに、未回答の依頼件数をオーナー名で出す）
+// v4.16: 席ごとの未回答（「考え中」表示の代わりに、未回答の依頼件数をオーナー名で出す。バーをタップすると一覧も見える）
+function unansweredList(room) {
+  return seatsInfo(room, null).map(s => {
+    const requests = db.kapioRequests
+      .filter(r => r.roomId === room.id && r.status === 'pending' && (r.ownerId || null) === (s.ownerId || null))
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+      .map(r => {
+        const trigger = r.triggerMessageId ? db.messages.find(m => m.id === r.triggerMessageId) : null;
+        const about = trigger && trigger.body
+          ? String(trigger.body).replace(/\s+/g, ' ').trim().slice(0, 60)
+          : (r.type === 'summary' ? '要約の依頼' : r.type === 'group' ? '全体宛の相談' : '返信の依頼');
+        const fromProf = db.profiles.find(p => p.id === r.requestedBy);
+        const fromName = (trigger && trigger.senderName) || (fromProf ? fromProf.name : null);
+        return { requestId: r.id, type: r.type, about, fromName, createdAt: r.createdAt };
+      });
+    return { seatId: s.seatId, ownerName: s.ownerName, name: s.name, count: requests.length, requests };
+  }).filter(x => x.count > 0);
+}
 function unansweredCounts(room) {
-  return seatsInfo(room, null)
-    .map(s => ({
-      seatId: s.seatId, ownerName: s.ownerName, name: s.name,
-      count: db.kapioRequests.filter(r => r.roomId === room.id && r.status === 'pending' && (r.ownerId || null) === (s.ownerId || null)).length,
-    }))
-    .filter(x => x.count > 0);
+  return unansweredList(room).map(x => ({ seatId: x.seatId, ownerName: x.ownerName, name: x.name, count: x.count }));
 }
 function broadcastUnanswered(roomId) {
   const room = roomById(roomId);
   if (!room) return;
-  broadcastRoom(roomId, { type: 'muse_unanswered', roomId, counts: unansweredCounts(room) });
+  const list = unansweredList(room);
+  broadcastRoom(roomId, {
+    type: 'muse_unanswered', roomId, list,
+    counts: list.map(x => ({ seatId: x.seatId, ownerName: x.ownerName, name: x.name, count: x.count })),
+  });
 }
 // v4.14: ブリッジ用イベントストリーム（SSE）の配信基盤。見張りがポーリングなしで新着を検知できるようにする
 let bridgeEventSeq = 0;
@@ -789,7 +806,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
