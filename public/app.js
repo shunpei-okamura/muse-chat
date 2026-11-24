@@ -206,6 +206,33 @@ let unansweredCounts = []; // v4.16: 席ごとの未回答件数 [{ seatId, owne
 let unansweredList = []; // v4.16: 未回答一覧（席ごと・依頼つき）
 let unansweredPanelOpen = false;
 
+// ---------- v4.20: お知らせ（トーク欄に出さない告知） ----------
+const noticesPanel = document.createElement('div');
+noticesPanel.className = 'notices-panel hidden';
+$('#view-chat').insertBefore(noticesPanel, $('#image-preview'));
+let roomNotices = []; // 新しい順
+let noticesPanelOpen = false;
+function addNotice(m) {
+  if (!m || !m.id || roomNotices.some(n => n.id === m.id)) return;
+  roomNotices.unshift({ id: m.id, senderName: m.senderName, body: m.body || '', createdAt: m.createdAt });
+  renderNotices();
+}
+function renderNotices() {
+  const btn = $('#notices-btn');
+  if (btn) btn.textContent = roomNotices.length ? `🔔${roomNotices.length}` : '🔔';
+  if (!noticesPanelOpen || !roomNotices.length) {
+    noticesPanel.classList.add('hidden');
+    if (!roomNotices.length) noticesPanelOpen = false;
+    return;
+  }
+  noticesPanel.innerHTML = roomNotices.map(n => `<div class="notice-item"><div class="notice-body">${esc(n.body || '')}</div><div class="notice-meta">${esc(n.senderName || '')} ・ ${esc(uaTime(n.createdAt))}</div></div>`).join('');
+  noticesPanel.classList.remove('hidden');
+}
+$('#notices-btn').addEventListener('click', () => {
+  noticesPanelOpen = !noticesPanelOpen;
+  renderNotices();
+});
+
 const PRESENCE_LABEL = {
   live: { dot: 'live', text: 'すぐ返信できます' },
   polling: { dot: 'polling', text: '返信まで数分かかります' },
@@ -318,6 +345,7 @@ async function openRoom(roomId) {
   activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
   unansweredCounts = detail.museUnanswered || [];
   unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
+  roomNotices = detail.notices || []; noticesPanelOpen = false; renderNotices();
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -388,6 +416,7 @@ function renderMessage(m) {
 const dayKey = (iso) => { const d = new Date(iso); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
 const dayLabel = (iso) => new Date(iso).toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' });
 function appendMessage(m) {
+  if (m.type === 'notice') { addNotice(m); return; }
   const list = $('#message-list');
   if (m.id && list.querySelector(`[data-msg-id="${CSS.escape(m.id)}"]`)) return;
   if (m.deleted) return;
@@ -460,6 +489,7 @@ async function syncMissed() {
     activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
     unansweredCounts = detail.museUnanswered || [];
   unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
+    roomNotices = detail.notices || []; renderNotices();
     renderMuseBar();
     renderMuseActivity();
     for (const m of msgs) appendMessage(m);
@@ -865,8 +895,13 @@ APIのベースURL: ${origin}
 【未回答の判定登録（verdict）: 分類したら必ず登録する】
 アプリの「未回答」表示（件数と一覧）は、この判定で決まります。依頼を分類したら、POST ${origin}/api/bridge/verdict（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "needs_answer": true/false, "title": "題名"}）で登録してください。再登録で上書きできます（分類が変わったら登録し直す）。
 - needs_answer=true（分類B・Q・G: オーナーの承認・回答が要るもの）: title に内容が分かる題名を付ける（例:「クリスマスパーティーの日程について」）。一覧ではこの題名が主表示になります。
+- 物差しは「オーナーの回答・判断がまだ要るか」だけです。設定変更や実装で解決するものは、オーナーの判断が出た時点で needs_answer=false に登録し直し、進捗はルームの「決めること（タスク）」で追ってください（未回答には残さない）。
 - needs_answer=false（分類A: 自分で回答済み／分類C: 回答不要）: title は不要です。要回答でないものは未回答表示に出ません。
 判定を付けていない依頼は未回答表示に出ません。処理の最後に判定まで済ませてください。
+
+【お知らせ（notice）】
+アップデート告知など、会話ではない連絡は「お知らせ」として届きます。GET /api/bridge/pending の応答の notices に入っているので、起きたら必ず目を通し、指示（指示文の取り直し等）があれば従ってください。お知らせへの返信は不要です。
+逆に、自分がアップデート告知などを出すときは、POST /api/bridge/post の本文に "notice": true を付けてください（トーク欄に出ず、お知らせとして配信されます）。
 
 【ループ防止（Aの前に必ず確認。contextの直近発言で判定）】
 1. 自席の発言が2回続いている（間に人間の発言がない）→ 自動返信しない（Cにする）。

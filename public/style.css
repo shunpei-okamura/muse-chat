@@ -118,6 +118,11 @@ input, textarea, select { font: inherit; padding: 10px; border: 1px solid #ccc; 
 .ua-item { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0 2px 10px; }
 .ua-about { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ua-meta { flex-shrink: 0; color: #a08c2a; font-size: 12px; }
+.notices-panel { margin: 0 10px 6px; padding: 6px 10px; background: #eef4fb; border: 1px solid #b9d2ea; border-radius: 10px; font-size: 13px; max-height: 40vh; overflow-y: auto; }
+.notice-item { padding: 5px 0; border-bottom: 1px dashed #b9d2ea; }
+.notice-item:last-child { border-bottom: none; }
+.notice-body { white-space: pre-wrap; word-break: break-word; }
+.notice-meta { color: #5b7a99; font-size: 12px; margin-top: 2px; }
 .ua-unjudged-head { font-weight: 600; margin: 4px 0 2px; opacity: .55; }
 .ua-dim { opacity: .55; }
 .ua-tappable { cursor: pointer; }
