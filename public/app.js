@@ -199,6 +199,7 @@ museActivity.className = 'muse-activity hidden';
 $('#view-chat').insertBefore(museActivity, $('#image-preview'));
 let activeRequests = new Map(); // requestId -> { state, type }
 let activityHideTimer = null;
+let unansweredCounts = []; // v4.16: 席ごとの未回答件数 [{ seatId, ownerName, name, count }]
 
 const PRESENCE_LABEL = {
   live: { dot: 'live', text: 'すぐ返信できます' },
@@ -230,30 +231,18 @@ function renderMuseBar() {
 }
 $('#kapio-summary').addEventListener('click', () => { kapioBarOpen = !kapioBarOpen; renderMuseBar(); });
 function renderMuseActivity() {
-  clearTimeout(activityHideTimer);
+  // v4.16: 「考え中」表示はやめ、席ごとの未回答件数をオーナー名で出す。全席0件ならバー自体を出さない
   if (!currentRoom) { museActivity.classList.add('hidden'); return; }
-  const states = [...activeRequests.values()];
-  if (!states.length) { museActivity.classList.add('hidden'); return; }
-  const thinking = states.find(s => s.state === 'thinking');
-  const called = states.find(s => s.state === 'called');
-  const expired = states.find(s => s.state === 'expired');
-  const name = (thinking || called || expired)?.name || 'Muse';
-  const presence = (thinking || called || expired)?.presence || 'offline';
-  let text = '';
-  let busy = false;
-  if (thinking) {
-    text = thinking.type === 'summary' ? `${name}が要約を書いています` : `${name}が考え中`;
-    busy = true;
-  } else if (called) {
-    if (presence === 'live') { text = called.type === 'summary' ? `${name}に要約を頼みました` : `${name}を呼んでいます`; busy = true; }
-    else if (presence === 'polling') text = `${name}に届きました。返信まで数分かかります`;
-    else text = `${name}に届きました。今は返信が遅れるかもしれません`;
-  } else if (expired) {
-    text = `${name}は時間内に返信できませんでした`;
-    activityHideTimer = setTimeout(() => { for (const [k, v] of activeRequests) if (v.state === 'expired') activeRequests.delete(k); renderMuseActivity(); }, 8000);
-  }
-  museActivity.innerHTML = `<span>${esc(text)}</span>${busy ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}`;
+  const counts = (unansweredCounts || []).filter(c => c.count > 0);
+  if (!counts.length) { museActivity.classList.add('hidden'); return; }
+  const text = counts.map(c => `${c.ownerName || c.name || 'Muse'} 未回答${c.count}件`).join('、');
+  museActivity.innerHTML = `<span>${esc(text)}</span>`;
   museActivity.classList.remove('hidden');
+}
+function handleMuseUnanswered(data) {
+  if (!currentRoom || data.roomId !== currentRoom.id) return;
+  unansweredCounts = Array.isArray(data.counts) ? data.counts : [];
+  renderMuseActivity();
 }
 function handleMuseStatus(data) {
   if (!currentRoom || data.roomId !== currentRoom.id) return;
@@ -272,6 +261,7 @@ async function openRoom(roomId) {
   currentRoom = detail;
   $('#chat-title').textContent = detail.name;
   activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
+  unansweredCounts = detail.museUnanswered || [];
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -412,6 +402,7 @@ async function syncMissed() {
     if (!currentRoom || currentRoom.id !== roomId) return;
     currentRoom = detail;
     activeRequests = new Map((detail.museActivity || []).map(a => [a.requestId, { state: a.state, type: a.type, name: a.name }]));
+    unansweredCounts = detail.museUnanswered || [];
     renderMuseBar();
     renderMuseActivity();
     for (const m of msgs) appendMessage(m);
@@ -630,7 +621,7 @@ $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
 });
 $('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; saveDraft(); });
-$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); renderMuseActivity(); show('#view-rooms'); loadRooms(); });
+$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); unansweredCounts = []; renderMuseActivity(); show('#view-rooms'); loadRooms(); });
 $('#call-kapio-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
   try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
@@ -804,7 +795,7 @@ APIのベースURL: ${origin}
 【処理の流れ】
 新しい依頼の前に、連絡スペースで approved になっているアイテムがあれば、その内容を POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "body": "..."}）で投稿して送信済みに記録する。skipped のアイテムの依頼が残っていれば POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じる。種類が post の approved アイテムがあれば、POST ${origin}/api/bridge/post {"room_id": "アイテムのルームID", "body": "投稿文"} でルームへ投稿して送信済みに記録する（post の文はオーナーが書いた原文のまま送り、書き換えない。ルームIDが分からない場合は room_id の代わりに room_name でも送れる）。その後、新しい依頼を以下に分類する。
 
-分類A（自動で返信してよい）: 挨拶・相づち・あなた自身への軽い質問への短答・オーナーが公言済みの事実の短い再掲。目安100字以内。約束・判断・予定の確定を含まない。人間の発言にも、他のMuseの発言にも反応してよい。POST ${origin}/api/bridge/typing {"request_id": "..."} で考え中を出し、reply で送信し、連絡スペースにログとして残す。
+分類A（自動で返信してよい）: 挨拶・相づち・あなた自身への軽い質問への短答・オーナーが公言済みの事実の短い再掲。目安100字以内。約束・判断・予定の確定を含まない。人間の発言にも、他のMuseの発言にも反応してよい。POST ${origin}/api/bridge/typing {"request_id": "..."} で受け取りを記録し、reply で送信し、連絡スペースにログとして残す。
 
 分類Q（質問への回答: 仮答→オーナー確認→本答）: あなた宛の質問（特にオーナーの事情・意向が絡むもの、確信が持てないもの）は即答しない。(1) reply に {"request_id": "...", "body": "おそらく○○だと思うけど、${profile.name}さんに聞いてみるね", "partial": true} を送り、仮答を表示する（○○はあなたの見立て）。(2) 連絡スペースに質問を登録し、オーナーに普段のチャットでも知らせる。(3) オーナーの回答を受けたら、それを本答として partial なしの reply で送る（仮答の吹き出しが本答に置き換わる）。
 
@@ -913,6 +904,8 @@ function connectWs() {
       }
     } else if (data.type === 'muse_status') {
       handleMuseStatus(data);
+    } else if (data.type === 'muse_unanswered') {
+      handleMuseUnanswered(data);
     } else if (data.type === 'muse_presence') {
       if (currentRoom && data.roomId === currentRoom.id && Array.isArray(currentRoom.muses)) {
         const s = currentRoom.muses.find(x => x.seatId === data.seatId);
