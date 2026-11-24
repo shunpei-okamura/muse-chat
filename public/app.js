@@ -721,13 +721,6 @@ $('#call-kapio-btn').addEventListener('click', async () => {
   try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
   catch (e) { alert(e.message); }
 });
-$('#summary-btn').addEventListener('click', async () => {
-  if (!currentRoom) return;
-  if (!currentRoom.kapioEnabled) { alert('このルームにはMuseが同席していません'); return; }
-  try { await api(`/api/rooms/${currentRoom.id}/summary-request`, { method: 'POST' }); }
-  catch (e) { alert(e.message); }
-});
-
 // ---------- room settings ----------
 $('#room-settings-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
@@ -756,7 +749,7 @@ $('#room-settings-btn').addEventListener('click', async () => {
     try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; $('#muse-prompt').value = buildBridgePrompt(t.bridgeToken); } catch { /* ignore */ }
   }
   $('#settings-kapio-mode').value = detail.kapioMode;
-  $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。「📋 会話を要約」を押すとMuseが作ります。';
+  $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。';
   renderDecisions(detail.decisions || []);
   renderTasks(detail.tasks || []);
   openModal('#modal-settings');
