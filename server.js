@@ -447,6 +447,7 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
   emitBridgeEvent(roomId, { type: 'message', room_id: roomId, message: { id: msg.id, sender_id: msg.senderId, sender_name: msg.senderName, type: msg.type, body: msg.body || '', created_at: msg.createdAt } });
+  bellMessage(msg);
 
   if (type !== 'system') {
     const preview = previewOf(msg);
@@ -561,6 +562,100 @@ function emitBridgeEvent(roomId, payload, ownerId = null) {
     if (visible) { try { c.res.write(`id: ${ev.id}\ndata: ${JSON.stringify(payload)}\n\n`); } catch (e) {} }
   }
 }
+// v4.15: 呼び鈴（Cloudflare）への写しの送信。BELL_URL と BELL_SECRET が無ければ何もしない（従来どおり）
+// 見張りを Render から呼び鈴へ移し、会話が無い間は Render が寝られるようにする
+const BELL_URL = (process.env.BELL_URL || '').replace(/\/$/, '');
+const BELL_SECRET = process.env.BELL_SECRET || '';
+const BELL_ENABLED = !!(BELL_URL && BELL_SECRET);
+const bell = { queue: [], inflight: false, timer: null, failures: 0, sent: 0, failed: 0, dropped: 0, lastOkAt: null, lastError: null, seatsSig: null };
+const BELL_QUEUE_MAX = 2000, BELL_BATCH = 50, BELL_MAX_TRIES = 20;
+const sha256hex = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+const roomSeatIds = (room) => seatsOf(room).map(seatIdOf);
+function bellEnqueue(ev) {
+  if (!BELL_ENABLED) return;
+  if (bell.queue.length >= BELL_QUEUE_MAX) { bell.queue.shift(); bell.dropped++; }
+  bell.queue.push({ ev, tries: 0 });
+  if (!bell.inflight && !bell.timer) bell.timer = setTimeout(bellFlush, 0);
+}
+async function bellFlush() {
+  bell.timer = null;
+  if (!BELL_ENABLED || bell.inflight || !bell.queue.length) return;
+  bell.inflight = true;
+  const batch = bell.queue.slice(0, BELL_BATCH);
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    const res = await fetch(`${BELL_URL}/publish`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${BELL_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: batch.map(b => b.ev) }),
+      signal: ctl.signal,
+    }).finally(() => clearTimeout(t));
+    if (!res.ok) throw new Error(`bell HTTP ${res.status}`);
+    bell.queue.splice(0, batch.length);
+    bell.sent += batch.length; bell.failures = 0; bell.lastOkAt = now(); bell.lastError = null;
+  } catch (e) {
+    bell.failures++; bell.failed++; bell.lastError = String(e && e.message || e).slice(0, 200);
+    for (const b of batch) b.tries++;
+    const before = bell.queue.length;
+    bell.queue = bell.queue.filter(b => b.tries < BELL_MAX_TRIES);
+    bell.dropped += before - bell.queue.length;
+  } finally {
+    bell.inflight = false;
+  }
+  if (bell.queue.length) {
+    const wait = bell.failures ? Math.min(1000 * 2 ** (bell.failures - 1), 60000) : 0;
+    bell.timer = setTimeout(bellFlush, wait);
+  }
+}
+function bellMessage(msg) {
+  const room = roomById(msg.roomId);
+  if (!room || !seatsOf(room).length) return;
+  const ownerId = typeof msg.senderId === 'string' && msg.senderId.startsWith('muse:') ? msg.senderId.slice(5) : null;
+  const owner = ownerId ? db.profiles.find(p => p.id === ownerId) : null;
+  bellEnqueue({ type: 'message', room_id: room.id, audience: roomSeatIds(room), data: {
+    id: msg.id, room_id: room.id, room_name: room.name, sender_id: msg.senderId, sender_name: msg.senderName,
+    owner_name: owner ? owner.name : null, type: msg.type, body: msg.body || '', has_image: !!msg.image,
+    reply_to: msg.replyTo || null, created_at: msg.createdAt,
+  } });
+}
+function bellRequest(r) {
+  const room = roomById(r.roomId);
+  if (!room) return;
+  bellEnqueue({ type: 'request', room_id: room.id, audience: [r.ownerId ? `muse:${r.ownerId}` : KAPIO_ID], data: requestView(r) });
+}
+function bellUnsent(msg, deleted = false) {
+  const room = roomById(msg.roomId);
+  if (!room || !seatsOf(room).length) return;
+  bellEnqueue({ type: 'unsent', room_id: room.id, audience: roomSeatIds(room), data: {
+    message_id: msg.id, room_id: room.id, room_name: room.name, sender_name: msg.senderName || null,
+    unsent_at: msg.unsentAt || now(), deleted,
+  } });
+}
+// 席と連携トークン（ハッシュのみ）の一覧。変わった時だけ送り直す（起動時は必ず送る）
+function bellSeatsSnapshot() {
+  const map = new Map();
+  for (const room of db.rooms) {
+    for (const s of seatsOf(room)) {
+      const sid = seatIdOf(s);
+      let token = null;
+      if (s.ownerId) { const p = db.profiles.find(x => x.id === s.ownerId); token = p && p.bridgeToken; }
+      else token = BRIDGE_TOKEN;
+      if (!token) continue;
+      if (!map.has(sid)) map.set(sid, { seat_id: sid, token_sha256: sha256hex(token), room_ids: [] });
+      map.get(sid).room_ids.push(room.id);
+    }
+  }
+  return [...map.values()].sort((a, b) => a.seat_id.localeCompare(b.seat_id));
+}
+function bellSyncSeats(force = false) {
+  if (!BELL_ENABLED) return;
+  const seats = bellSeatsSnapshot();
+  const sig = sha256hex(JSON.stringify(seats));
+  if (!force && sig === bell.seatsSig) return;
+  bell.seatsSig = sig;
+  bellEnqueue({ type: 'seats', room_id: null, audience: [], data: { seats } });
+}
 function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null) {
   if (type === 'reply') {
     // 受け取られる前に同じ人が同じ席を続けて呼んだ場合は1件にまとめる
@@ -583,6 +678,7 @@ function queueKapio(roomId, type, requestedBy, triggerMessageId, ownerId = null)
   museStatus(req, 'called');
   wakeWaiters(req);
   emitBridgeEvent(roomId, { type: 'request', room_id: roomId, request_id: req.id, request_type: type, from_seat: ownerId ? `muse:${ownerId}` : KAPIO_ID }, ownerId || null);
+  bellRequest(req);
   return req;
 }
 function requestView(r) {
@@ -646,6 +742,7 @@ app.get('/api/health', (req, res) => res.json({
   name: 'muse-chat', time: now(),
   storage: USE_REMOTE ? 'upstash' : 'file',
   lastSaveOkAt: persist.lastOkAt, saveFailures: persist.failures, lastSaveError: persist.lastError,
+  bell: { enabled: BELL_ENABLED, sent: bell.sent, failed: bell.failed, dropped: bell.dropped, queued: bell.queue.length, lastOkAt: bell.lastOkAt, lastError: bell.lastError },
 }));
 // v4.6: 開発ページと自前ソースの公開（公開リポジトリと同じ内容。みんなでデバッグ・改善するため）
 const SOURCE_FILES = { 'server.js': 'server.js', 'package.json': 'package.json', 'app.js': 'public/app.js', 'index.html': 'public/index.html', 'style.css': 'public/style.css', 'sw.js': 'public/sw.js', 'manifest.json': 'public/manifest.json' };
@@ -657,7 +754,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.14</strong></p>'
++ '<p>現在のバージョン: <strong>v4.15</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -675,7 +772,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -821,6 +918,7 @@ app.post('/api/messages/:msgId/unsend', auth, (req, res) => {
     if (r.status === 'pending' && r.triggerMessageId === msg.id) { r.cancelReason = 'unsent'; finishRequest(r, 'done'); }
   }
   updateMessage(msg);
+  bellUnsent(msg);
   res.json(msg);
 });
 app.post('/api/rooms/:id/read', auth, requireMember, (req, res) => {
@@ -1160,6 +1258,7 @@ app.post('/api/bridge/admin/delete-message', bridgeAuth, (req, res) => {
   db.messages = db.messages.filter(m => m.id !== messageId);
   saveRewrite(msg.roomId);
   broadcastRoom(msg.roomId, { type: 'message_updated', roomId: msg.roomId, message: { id: msg.id, roomId: msg.roomId, deleted: true } });
+  bellUnsent(msg, true);
   res.json({ ok: true });
 });
 // v4.10: 席を外す管理用API（muse-release と同じ処理を global ブリッジから実行できるように）
@@ -1323,6 +1422,9 @@ async function start() {
     }
   }, 30000);
   setInterval(() => { expireRequests(); checkPresence(); }, 15000);
+  // v4.15: 呼び鈴へ席の一覧を送る（起動時は必ず、その後は変わった時だけ）
+  bellSyncSeats(true);
+  setInterval(() => bellSyncSeats(false), 5000);
 
   // デプロイ時などの終了前に、未保存分を書き出す
   let stopping = false;
@@ -1337,6 +1439,11 @@ async function start() {
       try { await flushAll(); } catch (e) { console.error('final flush failed', e); }
       if (!persist.meta && !persist.appends.length && !persist.rewrite.size) break;
       await sleep(1000);
+    }
+    // v4.15: 呼び鈴への送信待ちを、最大3秒だけ送ってから終える
+    for (let i = 0; i < 30 && BELL_ENABLED && (bell.queue.length || bell.inflight); i++) {
+      if (!bell.inflight) { clearTimeout(bell.timer); bellFlush(); }
+      await sleep(100);
     }
     process.exit(0);
   };
