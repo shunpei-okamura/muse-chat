@@ -46,6 +46,11 @@ const POLLING_WINDOW_MS = 20 * 60 * 1000;                     // 巡回で拾っ
 const KEEP_DONE_REQ_MS = 7 * 24 * 60 * 60 * 1000;             // 処理済み依頼を保持する期間
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// v4.24: 回答期限 due は 'YYYY-MM-DD' または null。形式が違う値は null として扱う（後方互換）
+function isValidDue(v) { return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T00:00:00Z')); }
+function normalizeDue(v) { return isValidDue(v) ? v : null; }
+// リクエストボディの due を解釈する。キーが無ければ undefined（変更しない）、null/'' はクリア(null)、有効な日付文字列はその値、それ以外は 'invalid'
+function parseDueField(body) { if (!body || !('due' in body)) return undefined; const v = body.due; if (v === null || v === '') return null; return isValidDue(v) ? v : 'invalid'; }
 const id = () => crypto.randomBytes(8).toString('hex');
 const now = () => new Date().toISOString();
 
@@ -58,6 +63,8 @@ function normalizeDb() {
     if (!Array.isArray(db[k])) db[k] = [];
   }
   delete db.notifications; // v4.1: 通知は保存せず、未読メッセージから組み立てる
+  // v4.24: 既存タスクに due が無ければ null を補う（既存フィールドの挙動は変えない）
+  for (const t of db.tasks) { t.due = normalizeDue(t.due); }
   if (typeof db.seq !== 'number') db.seq = db.messages.reduce((a, m) => Math.max(a, m.seq || 0), 0);
   // v4.3: Muse席を複数席（room.muses）に移行する。ownerId が null の席はレガシー（カピお）席
   for (const room of db.rooms) {
@@ -828,7 +835,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.23</strong></p>'
++ '<p>現在のバージョン: <strong>v4.24</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -846,7 +853,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.24: 決めることボードの項目に「回答期限（due）」を追加。ボードで日付を設定・変更・クリアでき、カードに「期限：○月○日」を表示する（前日・当日・超過の未決定項目は控えめに色分け表示）。タスクAPIとブリッジ（作成時の due 任意指定、GET /api/bridge/tasks への due 追加、更新用 POST /api/bridge/task/update）を対応させた。既存タスク・既存フィールドの挙動は変更なし</li><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -1075,18 +1082,24 @@ app.get('/api/rooms/:id/tasks', auth, requireMember, (req, res) => res.json(db.t
 app.post('/api/rooms/:id/tasks', auth, requireMember, (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
-  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false };
+  const dueCreate = parseDueField(req.body);
+  if (dueCreate === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
+  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false, due: dueCreate === undefined ? null : dueCreate };
   db.tasks.push(t);
   save();
   res.json(t);
 });
 // v4.23追加: 備考（note）とリマインドON/OFF（remind）の更新。完了済みには付けない
+// v4.24追加: 回答期限（due）の更新もここで扱う。due は null でクリア可
 app.post('/api/rooms/:id/tasks/:taskId/update', auth, requireMember, (req, res) => {
   const t = db.tasks.find(x => x.id === req.params.taskId && x.roomId === req.room.id);
   if (!t) return res.status(404).json({ error: 'task not found' });
   if (t.done) return res.status(400).json({ error: 'task already done' });
+  const dueUpd = parseDueField(req.body);
+  if (dueUpd === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
   if (typeof req.body.note === 'string') t.note = req.body.note.trim().slice(0, 500);
   if (typeof req.body.remind === 'boolean') t.remind = req.body.remind;
+  if (dueUpd !== undefined) t.due = dueUpd;
   save();
   res.json(t);
 });
@@ -1331,7 +1344,9 @@ app.post('/api/bridge/task', bridgeAuth, (req, res) => {
   const text = String((req.body && req.body.text) || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
   const seat = req.bridge.kind === 'global' ? null : seatByOwner(room, req.bridge.profile.id);
-  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false };
+  const dueBridge = parseDueField(req.body);
+  if (dueBridge === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
+  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false, due: dueBridge === undefined ? null : dueBridge };
   db.tasks.push(t);
   save();
   res.json({ ok: true, task: t });
@@ -1343,8 +1358,28 @@ app.get('/api/bridge/tasks', bridgeAuth, (req, res) => {
   if (req.query.room_name) rooms = rooms.filter(r => r.name === String(req.query.room_name));
   if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
   const tasks = db.tasks.filter(t => !t.done && rooms.some(r => r.id === t.roomId))
-    .map(t => ({ id: t.id, room_id: t.roomId, room_name: (rooms.find(r => r.id === t.roomId) || {}).name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true }));
+    .map(t => ({ id: t.id, room_id: t.roomId, room_name: (rooms.find(r => r.id === t.roomId) || {}).name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true, due: normalizeDue(t.due) }));
   res.json({ ok: true, tasks });
+});
+// v4.24: 既存タスクの due / note / remind を更新するブリッジAPI。その席があるルームのタスクのみ操作可（globalトークンも可）。due は null でクリア可
+app.post('/api/bridge/task/update', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const taskId = req.body && (req.body.id || req.body.task_id);
+  if (!taskId) return res.status(400).json({ error: 'id required' });
+  const t = db.tasks.find(x => x.id === taskId);
+  if (!t) return res.status(404).json({ error: 'task not found' });
+  const room = roomById(t.roomId);
+  if (!room) return res.status(404).json({ error: 'room not found' });
+  const hasSeat = req.bridge.kind === 'global' ? seatsOf(room).length > 0 : !!seatByOwner(room, req.bridge.profile.id);
+  if (!hasSeat) return res.status(403).json({ error: 'no seat in this room' });
+  if (t.done) return res.status(400).json({ error: 'task already done' });
+  const dueBUpd = parseDueField(req.body);
+  if (dueBUpd === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
+  if (typeof (req.body && req.body.note) === 'string') t.note = req.body.note.trim().slice(0, 500);
+  if (typeof (req.body && req.body.remind) === 'boolean') t.remind = req.body.remind;
+  if (dueBUpd !== undefined) t.due = dueBUpd;
+  save();
+  res.json({ ok: true, task: t });
 });
 // v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
 app.get('/api/bridge/history', bridgeAuth, (req, res) => {
