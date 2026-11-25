@@ -27,6 +27,7 @@ let wsConnecting = false;
 let currentRoom = null;
 let roomsCache = [];
 let pendingImages = [];
+let pendingPdfs = []; // v4.23: PDF添付 { name, data }（最大2件、各2MBまで）
 let replyTargetId = null;
 let unreadStartSeq = 0;
 let chatMessages = [];
@@ -70,11 +71,13 @@ function setConnected(ok) {
 
 // ---------- views ----------
 function show(viewId) {
-  for (const v of ['#view-setup', '#view-rooms', '#view-chat', '#view-notifications']) $(v).classList.add('hidden');
+  for (const v of ['#view-setup', '#view-rooms', '#view-chat', '#view-notifications', '#view-board']) $(v).classList.add('hidden');
   $(viewId).classList.remove('hidden');
 }
 function openModal(sel) { $(sel).classList.remove('hidden'); }
 function closeModal(el) { el.closest('.modal').classList.add('hidden'); }
+// v4.23: モーダルの外側（背景）をタップしたら、保存せずに閉じる。全モーダル共通の挙動
+document.querySelectorAll('.modal').forEach(m => m.addEventListener('click', (e) => { if (e.target === m) m.classList.add('hidden'); }));
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', (e) => closeModal(e.target)));
 
 // ---------- setup ----------
@@ -233,35 +236,144 @@ $('#notices-btn').addEventListener('click', () => {
   renderNotices();
 });
 
+// ---------- v4.23: 決めることボード（フェーズ1: 既存 db.tasks / db.decisions の表示のみ。データ構造は変更しない） ----------
+// 表示の器はトークと並ぶ専用ビュー（#view-board）。中身（未決定／決まったこと／追加／バッジ）はパネル版から不変
+let boardTasks = []; // そのルームの tasks 全件（done 含む）
+let boardDecisions = []; // そのルームの decisions
+let boardEditingId = null; // 備考を編集中のタスクID
+let boardNoteDraft = ''; // 編集中の備考の下書き（再描画で消えないよう保持）
+function boardOpenTasks() { return boardTasks.filter(t => !t.done); }
+function renderBoard() {
+  const open = boardOpenTasks();
+  for (const badge of [$('#board-badge'), $('#board-badge2')]) {
+    if (badge) {
+      badge.textContent = String(open.length);
+      badge.classList.toggle('hidden', !open.length);
+    }
+  }
+  const count = $('#board-count');
+  if (count) count.textContent = `未決定 ${open.length}件`;
+  const roomName = $('#board-room-name');
+  if (roomName) roomName.textContent = currentRoom ? (currentRoom.name || '') : '';
+  const list = $('#board-list');
+  if (list) {
+    list.innerHTML = open.length
+      ? open.map(t => {
+          const editing = boardEditingId === t.id;
+          const noteBox = editing
+            ? `<div class="board-note-edit"><textarea class="board-note-input" data-id="${esc(t.id)}" maxlength="500" rows="2" placeholder="どこで止まっているか／何が確認事項か／誰のタスクか">${esc(boardNoteDraft)}</textarea><div class="board-note-edit-btns"><button type="button" class="sub-btn board-note-save" data-id="${esc(t.id)}">保存</button><button type="button" class="sub-btn board-note-cancel">キャンセル</button></div></div>`
+            : (t.note ? `<div class="board-note">📝 ${esc(t.note)}</div>` : '');
+          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${noteBox}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button></div></div>`;
+        }).join('')
+      : '<div class="board-empty">未決定のものはありません。</div>';
+    list.querySelectorAll('.board-done-btn').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/done`, { method: 'POST', body: '{}' }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-del-btn').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}`, { method: 'DELETE' }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-note-btn').forEach(b => b.addEventListener('click', () => {
+      const t = boardTasks.find(x => x.id === b.dataset.id);
+      boardEditingId = b.dataset.id;
+      boardNoteDraft = t ? (t.note || '') : '';
+      renderBoard();
+      const ta = list.querySelector('.board-note-input');
+      if (ta) ta.focus();
+    }));
+    const noteInput = list.querySelector('.board-note-input');
+    if (noteInput) noteInput.addEventListener('input', () => { boardNoteDraft = noteInput.value; });
+    list.querySelectorAll('.board-note-save').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      try {
+        await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ note: boardNoteDraft }) });
+        boardEditingId = null; boardNoteDraft = '';
+        await loadBoardData();
+      } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-note-cancel').forEach(b => b.addEventListener('click', () => {
+      boardEditingId = null; boardNoteDraft = '';
+      renderBoard();
+    }));
+    list.querySelectorAll('.board-remind-btn').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      const t = boardTasks.find(x => x.id === b.dataset.id);
+      if (!t) return;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ remind: !t.remind }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+  }
+  const decided = $('#board-decided');
+  if (decided) {
+    decided.innerHTML = boardDecisions.length
+      ? `<div class="board-decided-head">決まったこと</div>` + boardDecisions.map(d => `<div class="board-decided-item">✓ ${esc(d.text || '')}</div>`).join('')
+      : '';
+  }
+}
+async function loadBoardData() {
+  if (!currentRoom) return;
+  const detail = await api(`/api/rooms/${currentRoom.id}`);
+  if (!currentRoom || detail.id !== currentRoom.id) return;
+  currentRoom = detail;
+  boardTasks = detail.tasks || [];
+  boardDecisions = detail.decisions || [];
+  renderTasks(boardTasks);
+  renderDecisions(boardDecisions);
+  renderBoard();
+}
+async function openBoard() {
+  if (!currentRoom) return;
+  renderBoard();
+  show('#view-board');
+  try { await loadBoardData(); } catch { /* 取得できなければ手元のデータで表示 */ }
+}
+$('#tab-board-btn').addEventListener('click', openBoard);
+$('#tab-talk-btn').addEventListener('click', () => { if (currentRoom) show('#view-chat'); });
+$('#board-back-btn').addEventListener('click', () => { if (currentRoom) show('#view-chat'); });
+$('#board-add-btn').addEventListener('click', async () => {
+  const input = $('#board-input');
+  const text = input ? input.value.trim() : '';
+  if (!text || !currentRoom) return;
+  try {
+    await api(`/api/rooms/${currentRoom.id}/tasks`, { method: 'POST', body: JSON.stringify({ text }) });
+    input.value = '';
+    await loadBoardData();
+  } catch { /* 次回表示時に再取得 */ }
+});
+
 const PRESENCE_LABEL = {
   live: { dot: 'live', text: 'すぐ返信できます' },
   polling: { dot: 'polling', text: '返信まで数分かかります' },
   offline: { dot: 'offline', text: '今は返信が遅れるかもしれません' },
 };
-let kapioBarOpen = false;
+// v4.23: 同席中バーは廃止し、同席情報はメンバー一覧モーダル（#modal-members）に寄せた。
+// renderMuseBar の名前は既存の呼び出し箇所（presence更新など）のために残し、中身はメンバー一覧の描画にする
 function renderMuseBar() {
-  if (!currentRoom) return;
+  const list = $('#members-list');
+  if (!list || !currentRoom) return;
+  const humans = (currentRoom.members || []).filter(m => !m.isMuse);
   const seats = currentRoom.muses || [];
-  $('#kapio-bar').classList.toggle('hidden', !seats.length);
-  if (!seats.length) return;
   const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : '名前を呼ばれたときだけ返信';
-  const names = seats.map(s => s.ownerName ? `${s.name}（${s.ownerName}）` : s.name).join('・');
-  const agg = seats.some(s => s.presence === 'live') ? PRESENCE_LABEL.live : (seats.some(s => s.presence === 'polling') ? PRESENCE_LABEL.polling : PRESENCE_LABEL.offline);
-  $('#kapio-summary').innerHTML = `<span>🍸 ${esc(names)} 同席中 <i class="dot ${agg.dot}"></i></span><span class="kapio-chevron">${kapioBarOpen ? '▾' : '▸'}</span>`;
-  $('#kapio-detail').classList.toggle('hidden', !kapioBarOpen);
-  $('#kapio-status').innerHTML = seats.map(s => {
-    const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
-    return `<span class="seat-line">🍸 ${esc(s.name)}${s.ownerName ? `（${esc(s.ownerName)}）` : '（Muse）'}同席中<span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></span>`;
-  }).join('') + `<span class="seat-how">${esc(how)}</span>`;
-  const old = $('#call-kapio-btn');
-  if (old) old.classList.add('hidden');
-  document.querySelectorAll('.call-seat-btn').forEach(b => b.addEventListener('click', async () => {
+  let html = '<div class="members-head">参加者</div>';
+  html += humans.length
+    ? humans.map(m => `<div class="member-row"><span class="member-dot" style="background:${esc(m.color || '#999')}"></span><span>${esc(m.name)}${profile && m.id === profile.id ? '（自分）' : ''}</span></div>`).join('')
+    : '<div class="note">メンバーはいません。</div>';
+  if (seats.length) {
+    html += '<div class="members-head">Muse</div>';
+    html += seats.map(s => {
+      const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
+      return `<div class="member-row"><span>🍸 ${esc(s.name)}${s.ownerName ? `（${esc(s.ownerName)}）` : '（Muse）'}</span><span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></div>`;
+    }).join('');
+    html += `<div class="note">返信スタイル：${esc(how)}</div>`;
+  }
+  list.innerHTML = html;
+  list.querySelectorAll('.call-seat-btn').forEach(b => b.addEventListener('click', async () => {
     if (!currentRoom) return;
     try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST', body: JSON.stringify({ seatId: b.dataset.seat }) }); }
     catch (e) { alert(e.message); }
   }));
 }
-$('#kapio-summary').addEventListener('click', () => { kapioBarOpen = !kapioBarOpen; renderMuseBar(); });
+$('#members-btn').addEventListener('click', () => { renderMuseBar(); openModal('#modal-members'); });
 function renderMuseActivity() {
   // v4.16: 「考え中」表示はやめ、席ごとの未回答件数をオーナー名で出す。全席0件ならバー自体を出さない
   // v4.17: 件数は「要回答」と判定されたものだけ。判定前がある間はバー自体は出し、末尾に判定前の件数も添える
@@ -346,6 +458,7 @@ async function openRoom(roomId) {
   unansweredCounts = detail.museUnanswered || [];
   unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
   roomNotices = detail.notices || []; noticesPanelOpen = false; renderNotices();
+  boardTasks = detail.tasks || []; boardDecisions = detail.decisions || []; boardEditingId = null; boardNoteDraft = ''; renderBoard();
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -381,7 +494,7 @@ function quoteHtml(m) {
   if (!m.replyTo) return '';
   const orig = findMsg(m.replyTo);
   let text = '元のメッセージ';
-  if (orig) text = orig.type === 'unsent' ? '取り消されたメッセージ' : `${orig.senderName}: ${orig.body || (orig.image ? '画像' : '')}`;
+  if (orig) text = orig.type === 'unsent' ? '取り消されたメッセージ' : `${orig.senderName}: ${orig.body || (orig.image ? '画像' : (orig.file ? `📄 ${orig.file.name || 'PDF'}` : ''))}`;
   return `<div class="msg-quote" data-jump="${esc(m.replyTo)}">${linkify(esc(text.slice(0, 40)))}</div>`;
 }
 function renderMessage(m) {
@@ -403,11 +516,13 @@ function renderMessage(m) {
     ${isMe ? '' : `<div class="avatar" style="background:${esc(isKapio ? '#d4a017' : (member?.color || '#888'))}">${esc((m.senderName || '?').slice(0, 1))}</div>`}
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? `（${esc(seatOwner || 'Muse')}）` : ''}</div>`}
-      <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
+      <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.file ? `<a class="msg-pdf" href="#">📄 ${esc(m.file.name || 'PDFファイル')}</a>` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
       <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
   const img = row.querySelector('.msg-image');
   if (img) img.addEventListener('click', () => { $('#lightbox-img').src = m.image; $('#lightbox').classList.remove('hidden'); });
+  const pdfLink = row.querySelector('.msg-pdf');
+  if (pdfLink && m.file) pdfLink.addEventListener('click', (e) => { e.preventDefault(); openPdfFile(m.file); });
   const quote = row.querySelector('.msg-quote');
   if (quote) quote.addEventListener('click', () => jumpTo(m.replyTo));
   attachLongPress(row.querySelector('.msg-bubble'), m.id);
@@ -497,6 +612,7 @@ async function syncMissed() {
     unansweredCounts = detail.museUnanswered || [];
   unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
     roomNotices = detail.notices || []; renderNotices();
+    boardTasks = detail.tasks || []; boardDecisions = detail.decisions || []; renderBoard();
     renderMuseBar();
     renderMuseActivity();
     for (const m of msgs) appendMessage(m);
@@ -569,7 +685,7 @@ function setReplyTarget(m, focus = false) {
   const bar = $('#reply-bar');
   if (!m) { bar.classList.add('hidden'); }
   else {
-    $('#reply-bar-text').textContent = `返信: ${m.senderName}: ${(m.body || (m.image ? '画像' : '')).slice(0, 40)}`;
+    $('#reply-bar-text').textContent = `返信: ${m.senderName}: ${(m.body || (m.image ? '画像' : (m.file ? `📄 ${m.file.name || 'PDF'}` : ''))).slice(0, 40)}`;
     bar.classList.remove('hidden');
     if (focus) $('#composer-input').focus();
   }
@@ -606,27 +722,30 @@ let sending = false;
 async function sendCurrent() {
   const ta = $('#composer-input');
   const body = ta.value.trim();
-  if (!currentRoom || sending || (!body && !pendingImages.length)) return;
+  if (!currentRoom || sending || (!body && !pendingImages.length && !pendingPdfs.length)) return;
   const roomId = currentRoom.id;
   const replyTo = replyTargetId;
-  if (pendingImages.length) {
+  if (pendingImages.length || pendingPdfs.length) {
     sending = true;
     $('#send-btn').disabled = true;
-    const images = pendingImages.slice();
+    const jobs = [
+      ...pendingImages.map(src => ({ image: src })),
+      ...pendingPdfs.map(f => ({ file: f })),
+    ];
     clearPendingImages();
     ta.value = '';
     ta.style.height = 'auto';
     setReplyTarget(null);
     clearDraft(roomId);
     try {
-      for (let i = 0; i < images.length; i++) {
-        const payload = { image: images[i] };
+      for (let i = 0; i < jobs.length; i++) {
+        const payload = { ...jobs[i] };
         if (i === 0) { if (body) payload.body = body; if (replyTo) payload.replyTo = replyTo; }
         const m = await api(`/api/rooms/${roomId}/messages`, { method: 'POST', body: JSON.stringify(payload) });
         if (currentRoom && currentRoom.id === roomId) { appendMessage(m); scrollChat(); }
       }
     } catch (e) {
-      alert('画像の送信に失敗しました: ' + e.message);
+      alert('添付の送信に失敗しました: ' + e.message);
     } finally {
       sending = false;
       $('#send-btn').disabled = false;
@@ -644,6 +763,22 @@ async function sendCurrent() {
       .then(m => { appendMessage(m); scrollChat(); })
       .catch(e => { ta.value = body; saveDraft(); alert('送信できませんでした: ' + e.message); });
   }
+}
+
+// v4.23: PDFを開く（data URLをBlob URLに変換して新しいタブで開く。ブロックされたらダウンロードに切り替える）
+async function openPdfFile(file) {
+  try {
+    const blob = await (await fetch(file.data)).blob();
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, '_blank');
+    if (!w) {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name || 'document.pdf';
+      a.click();
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch { alert('PDFを開けませんでした'); }
 }
 
 // ---------- image attach ----------
@@ -669,13 +804,30 @@ function renderPendingImages() {
     t.appendChild(x);
     wrap.appendChild(t);
   });
-  $('#image-preview-note').textContent = pendingImages.length > 1 ? `${pendingImages.length}枚の画像を送信します` : 'この画像を送信します';
-  bar.classList.toggle('hidden', pendingImages.length === 0);
+  pendingPdfs.forEach((f, i) => {
+    const t = document.createElement('div');
+    t.className = 'pdf-chip';
+    const label = document.createElement('span');
+    label.textContent = `📄 ${f.name}`;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'img-thumb-x';
+    x.textContent = '✕';
+    x.setAttribute('aria-label', 'このPDFを外す');
+    x.addEventListener('click', () => { pendingPdfs.splice(i, 1); renderPendingImages(); });
+    t.appendChild(label);
+    t.appendChild(x);
+    wrap.appendChild(t);
+  });
+  const total = pendingImages.length + pendingPdfs.length;
+  $('#image-preview-note').textContent = total > 1 ? `${total}件の添付を送信します` : 'この添付を送信します';
+  bar.classList.toggle('hidden', total === 0);
   const input = $('#image-input');
   if (input) input.value = '';
 }
 function clearPendingImages() {
   pendingImages = [];
+  pendingPdfs = [];
   renderPendingImages();
 }
 function downscaleToDataUrl(file) {
@@ -698,10 +850,28 @@ function downscaleToDataUrl(file) {
   });
 }
 $('#image-btn').addEventListener('click', () => $('#image-input').click());
+const MAX_PENDING_PDFS = 2;
+const PDF_MAX_BYTES = 2 * 1024 * 1024;
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
 $('#image-input').addEventListener('change', async (e) => {
   const files = [...(e.target.files || [])];
   e.target.value = '';
   for (const file of files) {
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+    if (isPdf) {
+      if (pendingPdfs.length >= MAX_PENDING_PDFS) { alert(`PDFは一度に${MAX_PENDING_PDFS}件までです`); break; }
+      if (file.size > PDF_MAX_BYTES) { alert(`PDFは1件2MBまでです（${file.name} は ${(file.size / 1048576).toFixed(1)}MB）`); continue; }
+      try { pendingPdfs.push({ name: file.name, data: await readFileAsDataUrl(file) }); }
+      catch { alert('PDFを読み込めませんでした'); }
+      continue;
+    }
     if (pendingImages.length >= MAX_PENDING_IMAGES) { alert(`画像は一度に${MAX_PENDING_IMAGES}枚までです`); break; }
     try { pendingImages.push(await downscaleToDataUrl(file)); }
     catch { alert('画像を読み込めませんでした'); }
@@ -715,12 +885,7 @@ $('#composer-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendCurrent(); }
 });
 $('#composer-input').addEventListener('input', (e) => { e.target.style.height = 'auto'; e.target.style.height = e.target.scrollHeight + 'px'; saveDraft(); });
-$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); unansweredCounts = []; unansweredList = []; unansweredPanelOpen = false; renderMuseActivity(); show('#view-rooms'); loadRooms(); });
-$('#call-kapio-btn').addEventListener('click', async () => {
-  if (!currentRoom) return;
-  try { await api(`/api/rooms/${currentRoom.id}/call-kapio`, { method: 'POST' }); }
-  catch (e) { alert(e.message); }
-});
+$('#back-btn').addEventListener('click', () => { currentRoom = null; activeRequests = new Map(); unansweredCounts = []; unansweredList = []; unansweredPanelOpen = false; boardTasks = []; boardDecisions = []; renderBoard(); renderMuseActivity(); show('#view-rooms'); loadRooms(); });
 // ---------- room settings ----------
 $('#room-settings-btn').addEventListener('click', async () => {
   if (!currentRoom) return;
@@ -749,66 +914,20 @@ $('#room-settings-btn').addEventListener('click', async () => {
     try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; $('#muse-prompt').value = buildBridgePrompt(t.bridgeToken); } catch { /* ignore */ }
   }
   $('#settings-kapio-mode').value = detail.kapioMode;
-  $('#settings-summary').textContent = detail.lastSummary || 'まだ要約はありません。';
   renderDecisions(detail.decisions || []);
   renderTasks(detail.tasks || []);
   openModal('#modal-settings');
 });
 function renderDecisions(decisions) {
-  const ul = $('#decision-list');
-  ul.innerHTML = '';
-  for (const d of decisions) {
-    const li = document.createElement('li');
-    li.innerHTML = `<span>${esc(d.text)}</span>`;
-    const del = document.createElement('button');
-    del.textContent = '✕';
-    del.addEventListener('click', async () => {
-      await api(`/api/rooms/${currentRoom.id}/decisions/${d.id}`, { method: 'DELETE' });
-      li.remove();
-    });
-    li.appendChild(del);
-    ul.appendChild(li);
-  }
+  // v4.23: 決まったことの表示はボード側に一本化したため、ここはボード側のデータ同期だけを行う
+  boardDecisions = decisions || [];
+  if (typeof renderBoard === 'function') renderBoard();
 }
 function renderTasks(tasks) {
-  const ul = $('#task-list');
-  ul.innerHTML = '';
-  for (const t of tasks.filter(x => !x.done)) {
-    const li = document.createElement('li');
-    li.innerHTML = `<span>${esc(t.text)}</span>`;
-    const done = document.createElement('button');
-    done.textContent = '完了';
-    done.addEventListener('click', async () => {
-      await api(`/api/rooms/${currentRoom.id}/tasks/${t.id}/done`, { method: 'POST', body: '{}' });
-      li.remove();
-    });
-    li.appendChild(done);
-    const del = document.createElement('button');
-    del.textContent = '✕';
-    del.addEventListener('click', async () => {
-      await api(`/api/rooms/${currentRoom.id}/tasks/${t.id}`, { method: 'DELETE' });
-      li.remove();
-    });
-    li.appendChild(del);
-    ul.appendChild(li);
-  }
+  // v4.23: 設定モーダルのタスク表はボードに一本化したため、ここはボード側のデータ同期だけを行う
+  boardTasks = tasks || [];
+  if (typeof renderBoard === 'function') renderBoard();
 }
-$('#task-add-btn').addEventListener('click', async () => {
-  const text = $('#task-input').value.trim();
-  if (!text || !currentRoom) return;
-  await api(`/api/rooms/${currentRoom.id}/tasks`, { method: 'POST', body: JSON.stringify({ text }) });
-  $('#task-input').value = '';
-  const detail = await api(`/api/rooms/${currentRoom.id}`);
-  renderTasks(detail.tasks || []);
-});
-$('#decision-add-btn').addEventListener('click', async () => {
-  const text = $('#decision-input').value.trim();
-  if (!text || !currentRoom) return;
-  await api(`/api/rooms/${currentRoom.id}/decisions`, { method: 'POST', body: JSON.stringify({ text }) });
-  $('#decision-input').value = '';
-  const detail = await api(`/api/rooms/${currentRoom.id}`);
-  renderDecisions(detail.decisions || []);
-});
 $('#copy-link-btn').addEventListener('click', async () => {
   const input = $('#settings-link');
   input.select();

@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="stylesheet" href="/style.css?v=4.12">
+<link rel="stylesheet" href="/style.css?v=4.23">
 </head>
 <body>
 
@@ -54,15 +54,15 @@
     <button id="back-btn" class="icon-btn">←</button>
     <h1 id="chat-title">ルーム</h1>
     <div class="header-actions">
+      <button id="members-btn" class="icon-btn" title="メンバー">👥</button>
       <button id="notices-btn" class="icon-btn" title="お知らせ">🆕</button>
       <button id="room-settings-btn" class="icon-btn" title="ルーム設定">⚙️</button>
     </div>
   </header>
-  <div id="kapio-bar" class="kapio-bar hidden">
-    <button type="button" id="kapio-summary" class="kapio-summary"></button>
-    <div id="kapio-detail" class="kapio-detail hidden"><span id="kapio-status"></span></div>
-    <button id="call-kapio-btn" class="sub-btn">Museを呼ぶ</button>
-  </div>
+  <nav class="room-tabs">
+    <button type="button" class="room-tab active">トーク</button>
+    <button type="button" class="room-tab" id="tab-board-btn">ボード<span id="board-badge" class="tab-badge hidden">0</span></button>
+  </nav>
   <div id="message-list" class="message-list"></div>
   <div id="reply-bar" class="reply-bar hidden">
     <span id="reply-bar-text"></span>
@@ -74,10 +74,35 @@
     <button id="image-preview-remove" class="sub-btn">✕ 全部外す</button>
   </div>
   <footer class="composer">
-    <button id="image-btn" class="icon-btn" title="画像を送る">📷</button>
-    <input id="image-input" type="file" accept="image/*" multiple class="hidden">
+    <button id="image-btn" class="icon-btn" title="画像やPDFを添付">📷</button>
+    <input id="image-input" type="file" accept="image/*,.pdf,application/pdf" multiple class="hidden">
     <textarea id="composer-input" rows="1" placeholder="メッセージを入力"></textarea>
     <button id="send-btn" class="send-btn">送信</button>
+  </footer>
+</section>
+
+<!-- 決めることボード（v4.23: トークと並ぶ専用ビュー） -->
+<section id="view-board" class="view hidden">
+  <header class="app-header">
+    <button id="board-back-btn" class="icon-btn">←</button>
+    <h1>📋 決めることボード</h1>
+    <div class="header-actions">
+      <span id="board-room-name" class="board-room-name"></span>
+    </div>
+  </header>
+  <nav class="room-tabs">
+    <button type="button" class="room-tab" id="tab-talk-btn">トーク</button>
+    <button type="button" class="room-tab active">ボード<span id="board-badge2" class="tab-badge hidden">0</span></button>
+  </nav>
+  <div class="board-scroll">
+    <p class="board-notice">ルーム発の決めること・改善の正はこのタスク表です（台帳完成までの暫定。設計 v0.3 §9）。他の置き場にはリンクだけ置き、状態はここで管理します。</p>
+    <div class="board-head"><span>まだ決まっていない</span><span id="board-count" class="board-count"></span></div>
+    <div id="board-list"></div>
+    <div id="board-decided"></div>
+  </div>
+  <footer class="board-footer">
+    <input id="board-input" type="text" maxlength="300" placeholder="決めることを追加">
+    <button id="board-add-btn" class="sub-btn">追加</button>
   </footer>
 </section>
 
@@ -160,20 +185,6 @@
       </select>
     </label>
     <div class="summary-box">
-      <h3>最新の要約</h3>
-      <p id="settings-summary" class="summary-text">まだ要約はありません。</p>
-      <h3>決まったこと・約束</h3>
-      <ul id="decision-list" class="decision-list"></ul>
-      <div class="join-box">
-        <input id="decision-input" type="text" maxlength="300" placeholder="手動で追加">
-        <button id="decision-add-btn" class="sub-btn">追加</button>
-      </div>
-      <h3>決めること</h3>
-      <ul id="task-list" class="decision-list"></ul>
-      <div class="join-box">
-        <input id="task-input" type="text" maxlength="300" placeholder="決めることを追加">
-        <button id="task-add-btn" class="sub-btn">追加</button>
-      </div>
     </div>
     <div class="modal-btns">
       <button class="sub-btn" data-close>閉じる</button>
@@ -196,6 +207,17 @@
   </div>
 </div>
 
-<script src="/app.js?v=4.22"></script>
+<!-- メンバー一覧モーダル（v4.23: 同席中バーの置き換え） -->
+<div id="modal-members" class="modal hidden">
+  <div class="modal-card">
+    <h2>メンバー</h2>
+    <div id="members-list"></div>
+    <div class="modal-btns">
+      <button class="sub-btn" data-close>閉じる</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js?v=4.23"></script>
 </body>
 </html>
