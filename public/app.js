@@ -531,7 +531,7 @@ function renderMessage(m) {
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? `（${esc(seatOwner || 'Muse')}）` : ''}</div>`}
       <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.file ? `<a class="msg-pdf" href="#">📄 ${esc(m.file.name || 'PDFファイル')}</a>` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
-      <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}"></span>` : ''}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
+      <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}" title="既読の内訳とMuseの状況"></span>` : `<span class="msg-detail" title="既読の内訳とMuseの状況">詳細</span>`}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
   const img = row.querySelector('.msg-image');
   if (img) img.addEventListener('click', () => { $('#lightbox-img').src = m.image; $('#lightbox').classList.remove('hidden'); });
@@ -539,6 +539,10 @@ function renderMessage(m) {
   if (pdfLink && m.file) pdfLink.addEventListener('click', (e) => { e.preventDefault(); openPdfFile(m.file); });
   const quote = row.querySelector('.msg-quote');
   if (quote) quote.addEventListener('click', () => jumpTo(m.replyTo));
+  const readEl = row.querySelector('.msg-read');
+  if (readEl) readEl.addEventListener('click', () => openDetailSheet(m.id));
+  const detailEl = row.querySelector('.msg-detail');
+  if (detailEl) detailEl.addEventListener('click', () => openDetailSheet(m.id));
   attachLongPress(row.querySelector('.msg-bubble'), m.id);
   return row;
 }
@@ -607,7 +611,7 @@ function updateReadReceipts() {
     const el = document.getElementById('read-' + m.id);
     if (!el) continue;
     const readers = others.filter(x => (x.lastReadSeq || 0) >= (m.seq || 0)).length;
-    el.textContent = readers === 0 ? '' : (readers >= others.length ? '既読' : `既読 ${readers}`);
+    el.textContent = readers === 0 ? '未読' : (readers >= others.length ? '既読' : `既読 ${readers}`);
   }
 }
 function scrollChat() { const l = $('#message-list'); l.scrollTop = l.scrollHeight; }
@@ -635,6 +639,74 @@ async function syncMissed() {
     if (document.visibilityState === 'visible') api(`/api/rooms/${roomId}/read`, { method: 'POST' }).catch(() => {});
   } catch { /* retry on next reconnect */ }
 }
+
+// ---------- v4.25: 既読の内訳 + Museの処理状況シート ----------
+const detailSheet = document.createElement('div');
+detailSheet.className = 'sheet detail-sheet hidden';
+detailSheet.innerHTML = `<div class="sheet-card detail-card"><div class="detail-head"><strong>既読とMuseの状況</strong><button type="button" class="sub-btn detail-close">閉じる</button></div><div class="detail-body"></div></div>`;
+document.body.appendChild(detailSheet);
+detailSheet.addEventListener('click', (e) => { if (e.target === detailSheet || e.target.closest('.detail-close')) detailSheet.classList.add('hidden'); });
+const fmtDateTime = (iso) => iso ? new Date(iso).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+function deliveryLabel(d) {
+  if (!d) return '依頼なし';
+  if (d.status === 'done') return '処理済み';
+  if (d.status === 'expired') return '期限切れ';
+  if (d.status === 'pending') return d.picked_at ? '拾った（処理中）' : '未処理（依頼中）';
+  return d.status || '';
+}
+function deliveryTimes(d) {
+  if (!d) return '';
+  const parts = [];
+  if (d.created_at) parts.push(`依頼 ${fmtDateTime(d.created_at)}`);
+  if (d.picked_at) parts.push(`拾った ${fmtDateTime(d.picked_at)}`);
+  if (d.handled_at) parts.push(`処理 ${fmtDateTime(d.handled_at)}`);
+  if (d.status === 'pending' && d.expires_at) parts.push(`期限 ${fmtDateTime(d.expires_at)}`);
+  if (d.status === 'expired' && d.expires_at) parts.push(`期限 ${fmtDateTime(d.expires_at)}`);
+  return parts.join(' ・ ');
+}
+async function openDetailSheet(msgId) {
+  const m0 = findMsg(msgId);
+  if (!m0 || !currentRoom) return;
+  // 開く直前に最新を取り直す（deliveriesは依頼の進行で変わるため）
+  try {
+    const fresh = await api(`/api/rooms/${currentRoom.id}/messages`);
+    for (const f of fresh) { const idx = chatMessages.findIndex(x => x.id === f.id); if (idx >= 0) chatMessages[idx] = { ...chatMessages[idx], deliveries: f.deliveries }; }
+  } catch { /* 取得できなければ手元のデータで出す */ }
+  const m = findMsg(msgId) || m0;
+  const members = (currentRoom.members || []).filter(x => !x.isMuse);
+  const targets = members.filter(x => x.id !== m.senderId);
+  const read = targets.filter(x => (x.lastReadSeq || 0) >= (m.seq || 0));
+  const unread = targets.filter(x => (x.lastReadSeq || 0) < (m.seq || 0));
+  const person = (x) => `<div class="detail-row"><span class="member-dot" style="background:${esc(x.color || '#999')}"></span><span>${esc(x.name)}</span></div>`;
+  const isExempt = m.type === 'notice' || m.type === 'system' || m.type === 'unsent';
+  let claudeHtml = '';
+  if (isExempt) {
+    claudeHtml = `<p class="note">この発言はMuseへの依頼の対象外です。</p>`;
+  } else {
+    const deliveries = Array.isArray(m.deliveries) ? m.deliveries : [];
+    const seats = currentRoom.muses || [];
+    if (!deliveries.length && !seats.length) {
+      claudeHtml = `<p class="note">Museの席がありません（依頼なし）。</p>`;
+    } else if (!deliveries.length) {
+      claudeHtml = seats.map(s => `<div class="detail-row"><span>🍸 ${esc(s.name)}${s.ownerName ? `（${esc(s.ownerName)}）` : ''}</span><span class="detail-status">依頼なし</span></div>`).join('');
+    } else {
+      const bySeat = new Map(deliveries.map(d => [d.seat_id, d]));
+      const rows = [];
+      for (const s of seats) { const d = bySeat.get(s.seatId); rows.push({ name: `${s.name}${s.ownerName ? `（${s.ownerName}）` : ''}`, d: d || null }); bySeat.delete(s.seatId); }
+      for (const d of bySeat.values()) rows.push({ name: d.muse_name || 'Muse', d });
+      claudeHtml = rows.map(r => `<div class="detail-row detail-col"><div class="detail-line"><span>🍸 ${esc(r.name)}</span><span class="detail-status">${esc(deliveryLabel(r.d))}</span></div>${r.d ? `<div class="detail-times">${esc(deliveryTimes(r.d))}</div>` : ''}</div>`).join('');
+    }
+  }
+  detailSheet.querySelector('.detail-body').innerHTML = `
+    <div class="detail-msg">${esc(m.senderName || '')} ・ ${esc(fmtTime(m.createdAt))}<br>${esc((m.body || (m.image ? '（画像）' : (m.file ? '（PDF）' : ''))).slice(0, 80))}</div>
+    <h3>人間の既読</h3>
+    <div class="detail-sec"><div class="detail-sub">読んだ人（${read.length}）</div>${read.length ? read.map(person).join('') : '<p class="note">まだいません</p>'}</div>
+    <div class="detail-sec"><div class="detail-sub">まだ読んでいない人（${unread.length}）</div>${unread.length ? unread.map(person).join('') : '<p class="note">全員が読んでいます</p>'}</div>
+    <h3>Museの状況</h3>
+    <div class="detail-sec">${claudeHtml}</div>`;
+  detailSheet.classList.remove('hidden');
+}
+
 // ---------- long press menu (copy / unsend) ----------
 const sheet = document.createElement('div');
 sheet.className = 'sheet hidden';

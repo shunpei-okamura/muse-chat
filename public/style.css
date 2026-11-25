@@ -203,3 +203,18 @@ button:focus-visible { outline: 2px solid #0984e3; outline-offset: 2px; }
 .seat-line .presence { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #6b5a1e; }
 .call-seat-btn { margin-left: auto; }
 .seat-how { display: block; font-size: 12px; color: #6b5a1e; margin-top: 2px; }
+
+/* v4.25: detail sheet (read receipts + Muse status) */
+.msg-read { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.msg-detail { font-size: 10px; color: #5b7a99; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.detail-card { max-height: 85dvh; overflow-y: auto; padding: 16px; gap: 10px; text-align: left; }
+.detail-head { display: flex; justify-content: space-between; align-items: center; }
+.detail-body h3 { font-size: 14px; margin: 14px 0 6px; }
+.detail-msg { font-size: 13px; color: #555; background: #f5f6f8; border-radius: 8px; padding: 8px 10px; word-break: break-word; }
+.detail-sec { display: flex; flex-direction: column; gap: 4px; }
+.detail-sub { font-size: 12px; color: #888; font-weight: 600; }
+.detail-row { display: flex; align-items: center; gap: 8px; font-size: 14px; padding: 4px 0; border-bottom: 1px solid #f0f2f5; }
+.detail-col { flex-direction: column; align-items: stretch; gap: 2px; }
+.detail-line { display: flex; justify-content: space-between; gap: 8px; }
+.detail-status { font-weight: 600; color: #6b5a1e; white-space: nowrap; }
+.detail-times { font-size: 12px; color: #888; }
