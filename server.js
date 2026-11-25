@@ -349,6 +349,19 @@ function broadcastRead(roomId, profileId) {
 function validImage(v) {
   return (typeof v === 'string' && v.startsWith('data:image/') && v.length <= 1600000) ? v : null;
 }
+// v4.23: PDF添付。{ name, data(data URL) } を検証して返す
+// 上限は実ファイル約2MB（base64で約2.7MB）。根拠: express.json の上限4mbに余裕を持って収まること、
+// DBはルーム単位のJSONでRedisに保存され全保存に効くため画像上限（data URL 1.6MB）と同オーダーに抑えること
+const PDF_DATA_MAX = 2800000;
+function validPdfFile(v) {
+  if (!v || typeof v !== 'object') return null;
+  const data = v.data;
+  if (typeof data !== 'string' || data.length > PDF_DATA_MAX) return null;
+  if (!data.startsWith('data:application/pdf;base64,JVBERi')) return null; // JVBERi = "%PDF-" のbase64先頭
+  const name = String(v.name || 'document.pdf').slice(0, 100) || 'document.pdf';
+  return { name, data };
+}
+function bridgeFile(body) { return validPdfFile(body && body.file); }
 // v4.11: ブリッジ投稿・返信の画像入力（image 単体 / images 配列、最大4枚）を検証して配列で返す
 function bridgeImages(body) {
   const list = [];
@@ -359,7 +372,8 @@ function bridgeImages(body) {
 function previewOf(m) {
   if (m.type === 'unsent') return '送信を取り消しました';
   if (m.body) return m.body.slice(0, 80);
-  return m.image ? '画像を送信しました' : '';
+  if (m.image) return '画像を送信しました';
+  return m.file ? `📄 ${m.file.name || 'PDFを送信しました'}` : '';
 }
 function roomView(room, profileId) {
   let last = null;
@@ -452,7 +466,7 @@ function postMessage(roomId, senderId, senderName, body, type = 'text', image = 
   db.seq = (db.seq || 0) + 1;
   let replyTo = null;
   if (extra.replyTo && db.messages.some(m => m.id === extra.replyTo && m.roomId === roomId)) replyTo = extra.replyTo;
-  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, replyTo, via: extra.via || null, createdAt: now() };
+  const msg = { id: id() + Date.now().toString(36), seq: db.seq, roomId, senderId, senderName, body, type, image: image || null, file: extra.file || null, replyTo, via: extra.via || null, createdAt: now() };
   db.messages.push(msg);
   if (room) room.updatedAt = msg.createdAt;
   broadcastRoom(roomId, { type: 'message', roomId, message: msg });
@@ -814,7 +828,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.22</strong></p>'
++ '<p>現在のバージョン: <strong>v4.23</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -832,7 +846,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -959,8 +973,9 @@ app.get('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
 app.post('/api/rooms/:id/messages', auth, requireMember, (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 4000);
   const image = validImage(req.body.image);
-  if (!body && !image) return res.status(400).json({ error: 'body required' });
-  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body, image && !body ? 'image' : 'text', image, { replyTo: req.body.replyTo });
+  const file = validPdfFile(req.body.file);
+  if (!body && !image && !file) return res.status(400).json({ error: 'body required' });
+  const msg = postMessage(req.room.id, req.profile.id, req.profile.name, body, image && !body && !file ? 'image' : 'text', image, { replyTo: req.body.replyTo, file });
   res.json(msg);
 });
 app.post('/api/messages/:msgId/unsend', auth, (req, res) => {
@@ -972,6 +987,7 @@ app.post('/api/messages/:msgId/unsend', auth, (req, res) => {
   msg.type = 'unsent';
   msg.body = '';
   msg.image = null;
+  msg.file = null;
   msg.unsentAt = now();
   // この発言をきっかけにした未処理のMuse依頼は取り下げる
   for (const r of db.kapioRequests) {
@@ -1059,8 +1075,18 @@ app.get('/api/rooms/:id/tasks', auth, requireMember, (req, res) => res.json(db.t
 app.post('/api/rooms/:id/tasks', auth, requireMember, (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
-  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null };
+  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false };
   db.tasks.push(t);
+  save();
+  res.json(t);
+});
+// v4.23追加: 備考（note）とリマインドON/OFF（remind）の更新。完了済みには付けない
+app.post('/api/rooms/:id/tasks/:taskId/update', auth, requireMember, (req, res) => {
+  const t = db.tasks.find(x => x.id === req.params.taskId && x.roomId === req.room.id);
+  if (!t) return res.status(404).json({ error: 'task not found' });
+  if (t.done) return res.status(400).json({ error: 'task already done' });
+  if (typeof req.body.note === 'string') t.note = req.body.note.trim().slice(0, 500);
+  if (typeof req.body.remind === 'boolean') t.remind = req.body.remind;
   save();
   res.json(t);
 });
@@ -1210,21 +1236,26 @@ app.post('/api/bridge/reply', bridgeAuth, (req, res) => {
     }
   }
   const images = bridgeImages(req.body);
+  const file = bridgeFile(req.body);
   let message = null;
   const earlier = r.partialMessageId ? db.messages.find(m => m.id === r.partialMessageId && m.type !== 'unsent') : null;
+  if (file) {
+    // v4.23: PDFは単独メッセージで投稿（画像が無い場合だけ本文をキャプションとして付ける）
+    message = postMessage(room.id, senderId, senderName, images.length ? '' : body, 'text', null, { replyTo: r.triggerMessageId, via: 'reply', file });
+  }
   if (images.length) {
     // v4.11: 画像は1枚ずつ別メッセージで投稿（最初の1枚にだけ本文をキャプションとして付ける）
     images.forEach((img, i) => {
-      const cap = i === 0 ? body : '';
+      const cap = i === 0 && !file ? body : '';
       const m = postMessage(room.id, senderId, senderName, cap, img && !cap ? 'image' : 'text', img, { replyTo: r.triggerMessageId, via: 'reply' });
       if (!message) message = m;
     });
-  } else if (body && earlier) {
+  } else if (!file && body && earlier) {
     earlier.body = body;
     earlier.editedAt = now();
     updateMessage(earlier);
     message = earlier;
-  } else if (body) {
+  } else if (!file && body) {
     message = postMessage(room.id, senderId, senderName, body, 'text', null, { replyTo: r.triggerMessageId, via: 'reply' });
   }
   if (partial) {
@@ -1258,7 +1289,8 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   if (!room) return res.status(404).json({ error: 'room not found' });
   const body = String((req.body && req.body.body) || '').trim().slice(0, 4000);
   const images = bridgeImages(req.body);
-  if (!body && !images.length) return res.status(400).json({ error: 'body or image required' });
+  const file = bridgeFile(req.body);
+  if (!body && !images.length && !file) return res.status(400).json({ error: 'body, image or file required' });
   let seat = null;
   if (req.bridge.kind === 'global') seat = seatsOf(room).find(s => !s.ownerId) || null;
   else seat = seatByOwner(room, req.bridge.profile.id);
@@ -1269,13 +1301,17 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
     return res.json({ ok: true, message_id: m.id, message_ids: [m.id] });
   }
   // v4.11: 画像はアプリと同じ形で1枚ずつ別メッセージ（最初の1枚にだけ body をキャプションとして付ける）
+  // v4.23: PDF（file）も同じ形で単独メッセージ。キャプションは先頭の添付にだけ付ける
   const ids = [];
+  if (file) {
+    ids.push(postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text', null, { via: 'post', file }).id);
+  }
   if (images.length) {
     images.forEach((img, i) => {
-      const cap = i === 0 ? body : '';
+      const cap = i === 0 && !file ? body : '';
       ids.push(postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', cap, img && !cap ? 'image' : 'text', img, { via: 'post' }).id);
     });
-  } else {
+  } else if (!file) {
     ids.push(postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'text', null, { via: 'post' }).id);
   }
   res.json({ ok: true, message_id: ids[0], message_ids: ids });
@@ -1295,7 +1331,7 @@ app.post('/api/bridge/task', bridgeAuth, (req, res) => {
   const text = String((req.body && req.body.text) || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
   const seat = req.bridge.kind === 'global' ? null : seatByOwner(room, req.bridge.profile.id);
-  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null };
+  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false };
   db.tasks.push(t);
   save();
   res.json({ ok: true, task: t });
@@ -1307,7 +1343,7 @@ app.get('/api/bridge/tasks', bridgeAuth, (req, res) => {
   if (req.query.room_name) rooms = rooms.filter(r => r.name === String(req.query.room_name));
   if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
   const tasks = db.tasks.filter(t => !t.done && rooms.some(r => r.id === t.roomId))
-    .map(t => ({ id: t.id, room_id: t.roomId, room_name: (rooms.find(r => r.id === t.roomId) || {}).name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt }));
+    .map(t => ({ id: t.id, room_id: t.roomId, room_name: (rooms.find(r => r.id === t.roomId) || {}).name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true }));
   res.json({ ok: true, tasks });
 });
 // v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
