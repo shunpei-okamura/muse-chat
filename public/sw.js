@@ -1,5 +1,5 @@
-const CACHE = 'muse-chat-v4.23';
-const SHELL = ['/', '/index.html', '/style.css?v=4.23', '/app.js?v=4.23', '/manifest.json', '/icon.svg', '/icon.png'];
+const CACHE = 'muse-chat-v4.24';
+const SHELL = ['/', '/index.html', '/style.css?v=4.24', '/app.js?v=4.24', '/manifest.json', '/icon.svg', '/icon.png'];
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });

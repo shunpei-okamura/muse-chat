@@ -143,6 +143,13 @@ input, textarea, select { font: inherit; padding: 10px; border: 1px solid #ccc; 
 .board-note { background: #fff; border: 1px solid #e8d48b; border-radius: 8px; padding: 6px 8px; margin-top: 6px; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
 .board-sub { display: flex; gap: 8px; margin-top: 6px; }
 .board-remind-btn.on { background: #ffedb5; border-color: #d4a017; font-weight: 600; }
+.board-due { display: inline-block; background: #fff; border: 1px solid #e8d48b; border-radius: 8px; padding: 3px 8px; margin-top: 6px; font-size: 13px; color: #6b5900; }
+.board-due.due-tomorrow { border-color: #d4a017; background: #ffedb5; }
+.board-due.due-today { border-color: #e07b00; background: #ffe8cc; font-weight: 600; }
+.board-due.due-overdue { border-color: #c0392b; background: #fdecea; color: #922b21; font-weight: 600; }
+.board-sub { flex-wrap: wrap; align-items: center; }
+.board-due-edit { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: #6b5900; white-space: nowrap; }
+.board-due-input { font-size: 13px; padding: 3px 4px; }
 .board-note-edit { margin-top: 6px; }
 .board-note-input { width: 100%; box-sizing: border-box; font-size: 13px; }
 .board-note-edit-btns { display: flex; gap: 8px; margin-top: 4px; }

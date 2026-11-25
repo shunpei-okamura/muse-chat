@@ -243,6 +243,9 @@ let boardDecisions = []; // そのルームの decisions
 let boardEditingId = null; // 備考を編集中のタスクID
 let boardNoteDraft = ''; // 編集中の備考の下書き（再描画で消えないよう保持）
 function boardOpenTasks() { return boardTasks.filter(t => !t.done); }
+// v4.24: 回答期限（due: 'YYYY-MM-DD' | null）の表示ヘルパー。日付の前後判定は端末のローカル日付で行う
+function boardTodayStr() { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
+function boardDueInfo(t) { const due = (t && typeof t.due === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.due)) ? t.due : null; if (!due) return { due: null, label: '', cls: '', tag: '' }; const [, m, d] = due.split('-'); const label = `期限：${Number(m)}月${Number(d)}日`; const today = boardTodayStr(); const tom = new Date(); tom.setDate(tom.getDate() + 1); const p2 = (n) => String(n).padStart(2, '0'); const tomorrow = `${tom.getFullYear()}-${p2(tom.getMonth() + 1)}-${p2(tom.getDate())}`; if (due < today) return { due, label, cls: ' due-overdue', tag: '超過' }; if (due === today) return { due, label, cls: ' due-today', tag: '今日まで' }; if (due === tomorrow) return { due, label, cls: ' due-tomorrow', tag: '明日まで' }; return { due, label, cls: '', tag: '' }; }
 function renderBoard() {
   const open = boardOpenTasks();
   for (const badge of [$('#board-badge'), $('#board-badge2')]) {
@@ -263,7 +266,9 @@ function renderBoard() {
           const noteBox = editing
             ? `<div class="board-note-edit"><textarea class="board-note-input" data-id="${esc(t.id)}" maxlength="500" rows="2" placeholder="どこで止まっているか／何が確認事項か／誰のタスクか">${esc(boardNoteDraft)}</textarea><div class="board-note-edit-btns"><button type="button" class="sub-btn board-note-save" data-id="${esc(t.id)}">保存</button><button type="button" class="sub-btn board-note-cancel">キャンセル</button></div></div>`
             : (t.note ? `<div class="board-note">📝 ${esc(t.note)}</div>` : '');
-          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${noteBox}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button></div></div>`;
+          const di = boardDueInfo(t);
+          const dueBox = di.due ? `<div class="board-due${di.cls}">📅 ${esc(di.label)}${di.tag ? `（${esc(di.tag)}）` : ''}</div>` : '';
+          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${dueBox}${noteBox}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button><label class="board-due-edit">📅 期限 <input type="date" class="board-due-input" data-id="${esc(t.id)}" value="${esc(di.due || '')}"></label>${di.due ? `<button type="button" class="sub-btn board-due-clear" data-id="${esc(t.id)}">期限を消す</button>` : ''}</div></div>`;
         }).join('')
       : '<div class="board-empty">未決定のものはありません。</div>';
     list.querySelectorAll('.board-done-btn').forEach(b => b.addEventListener('click', async () => {
@@ -301,6 +306,15 @@ function renderBoard() {
       const t = boardTasks.find(x => x.id === b.dataset.id);
       if (!t) return;
       try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ remind: !t.remind }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-due-input').forEach(inp => inp.addEventListener('change', async () => {
+      if (!currentRoom) return;
+      const v = inp.value ? inp.value : null;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${inp.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ due: v }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-due-clear').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ due: null }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
     }));
   }
   const decided = $('#board-decided');
