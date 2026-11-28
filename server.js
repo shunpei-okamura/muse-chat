@@ -68,7 +68,37 @@ function normalizeVotes(v) {
     condition: x.condition ? String(x.condition).slice(0, 200) : null,
     registeredBy: x.registeredBy === 'human' ? 'human' : 'muse',
     updatedAt: x.updatedAt || null,
+    proposalAt: x.proposalAt || null,
   }));
+}
+// v4.27: proposal（現在の提案）。{ text, updatedAt, updatedBy } または null（未設定）
+function normalizeProposal(v) {
+  if (!v || typeof v !== 'object') return null;
+  const text = String(v.text || '').trim().slice(0, 300);
+  if (!text) return null;
+  return { text, updatedAt: v.updatedAt || null, updatedBy: v.updatedBy ? String(v.updatedBy).slice(0, 40) : null };
+}
+function proposalAtOf(t) { const p = normalizeProposal(t && t.proposal); return p ? (p.updatedAt || null) : null; }
+// 現在の提案への票だけ（proposal未設定時は proposalAt=null の旧票＝後方互換）
+function currentVotes(t) { const at = proposalAtOf(t); return normalizeVotes(t.votes).filter(v => (v.proposalAt || null) === at); }
+// body の proposal を解釈。キー無し=undefined(変更しない)、null/''/{text:''}=クリア(null)、文字列/ {text}=その文、それ以外='invalid'
+function parseProposalField(body) {
+  if (!body || !('proposal' in body)) return undefined;
+  const v = body.proposal;
+  if (v === null || v === '') return null;
+  if (typeof v === 'string') { const tx = v.trim().slice(0, 300); return tx ? tx : null; }
+  if (v && typeof v === 'object') { const tx = String(v.text || '').trim().slice(0, 300); return tx ? tx : null; }
+  return 'invalid';
+}
+// 提案を適用。文が変わったら既存の票・優勢宣言・異議は前の提案へのものなのでリセットする。変わった場合 true
+function applyProposal(t, textOrNull, byName) {
+  const cur = normalizeProposal(t.proposal);
+  const curText = cur ? cur.text : null;
+  if (textOrNull === curText) return false;
+  if (textOrNull === null) t.proposal = null;
+  else t.proposal = { text: textOrNull, updatedAt: now(), updatedBy: byName || null };
+  t.votes = []; t.dominance = null; t.objections = [];
+  return true;
 }
 function normalizeStances(v) {
   if (!Array.isArray(v)) return [];
@@ -91,14 +121,15 @@ function normalizeReactions(v) {
 function taskView(t) {
   return {
     ...t, due: normalizeDue(t.due), kind: normalizeKind(t.kind), phase: normalizePhase(t.phase),
-    votes: normalizeVotes(t.votes), stances: normalizeStances(t.stances),
+    proposal: normalizeProposal(t.proposal),
+    votes: currentVotes(t), stances: normalizeStances(t.stances),
     dominance: t.dominance || null, objections: Array.isArray(t.objections) ? t.objections : [],
   };
 }
 // 票の集計。分母は全席（Muse席の総数）。賛成側=yes+yes_conditional、反対=no、holdはどちらにも数えない
 function voteSummary(room, t) {
   const total = seatsOf(room).length;
-  const votes = normalizeVotes(t.votes);
+  const votes = currentVotes(t);
   const yes = votes.filter(v => v.choice === 'yes').length;
   const yesConditional = votes.filter(v => v.choice === 'yes_conditional').length;
   const no = votes.filter(v => v.choice === 'no').length;
@@ -143,7 +174,7 @@ function normalizeDb() {
   }
   delete db.notifications; // v4.1: 通知は保存せず、未読メッセージから組み立てる
   // v4.24: 既存タスクに due が無ければ null を補う（既存フィールドの挙動は変えない）
-  for (const t of db.tasks) { t.due = normalizeDue(t.due); t.kind = normalizeKind(t.kind); t.phase = normalizePhase(t.phase); if (!Array.isArray(t.votes)) t.votes = []; if (!Array.isArray(t.stances)) t.stances = []; }
+  for (const t of db.tasks) { t.due = normalizeDue(t.due); t.kind = normalizeKind(t.kind); t.phase = normalizePhase(t.phase); t.proposal = normalizeProposal(t.proposal); if (!Array.isArray(t.votes)) t.votes = []; if (!Array.isArray(t.stances)) t.stances = []; }
   for (const m of db.messages) { if (!Array.isArray(m.reactions)) m.reactions = []; }
   if (typeof db.seq !== 'number') db.seq = db.messages.reduce((a, m) => Math.max(a, m.seq || 0), 0);
   // v4.3: Muse席を複数席（room.muses）に移行する。ownerId が null の席はレガシー（カピお）席
@@ -906,7 +937,7 @@ app.use(express.json({ limit: '4mb' }));
 
 app.get('/api/health', (req, res) => res.json({
   ok: persist.failures < 3,
-  name: 'muse-chat', version: '4.26', time: now(),
+  name: 'muse-chat', version: '4.27', time: now(),
   vapid: { configured: !!webpush, publicKeyPresent: !!VAPID_PUBLIC, privateKeyPresent: !!VAPID_PRIVATE },
   storage: USE_REMOTE ? 'upstash' : 'file',
   lastSaveOkAt: persist.lastOkAt, saveFailures: persist.failures, lastSaveError: persist.lastError,
@@ -922,7 +953,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.26</strong></p>'
++ '<p>現在のバージョン: <strong>v4.27</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -940,7 +971,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.26: LINE脱却の全部入り。決めることボードに投票（賛成／条件付き賛成／反対／保留、条件付きは条件必須・賛成側に集計）と割合ゲージ（全席分母・50%目印）、希望条件・譲れない点・温度感の申告、フェーズ（議題立て／条件申告／候補提示／投票／決着／保留）、種別 kind（decision／ops）を追加。決着は集約席の優勢宣言→24時間の異議窓（譲れない点に触れる場合のみ有効）→decisions登録＋完了で確定し、過半数なしは保留へ。ブリッジに vote／stance／relay／declare／object／finalize／reaction（Museは👀のみ）を追加し、task/update で完了（done）もできるようにした。bridge/post の ops:true はボードの kind=ops 項目として登録され、トーク・未読・プッシュ・依頼の対象外。プッシュは状態表示（許可・購読・VAPID有無）とテスト送信で切り分け可能に。リアクション（人間は👍👀✅）を追加（票ではない旨を明記）。返信スタイルの選択欄は撤去し「自動返信：オン（全席共通ルール）」の状態表示に変更。内蔵指示文を v2026-11-28版に差し替え（運用系変更依頼の扱い・ノイズ削減・分類Aは100字一律・有効期限は全種別24時間）</li><li>v4.25: 既読の内訳とMuseの処理状況の表示を追加。自分の発言の「既読／既読 N」をタップすると、読んだ人・まだ読んでいない人と、各Muse席の依頼処理状況（依頼なし／未処理／拾った／処理済み／期限切れ、時刻つき）をまとめたシートが開く。ルーム表示用の発言データに deliveries を後方互換な追加で付けた（既存フィールド・データ構造・認証は変更なし）。お知らせ・システム発言など依頼が作られない発言ではMuse欄を「対象外」と表示する</li><li>v4.24: 決めることボードの項目に「回答期限（due）」を追加。ボードで日付を設定・変更・クリアでき、カードに「期限：○月○日」を表示する（前日・当日・超過の未決定項目は控えめに色分け表示）。タスクAPIとブリッジ（作成時の due 任意指定、GET /api/bridge/tasks への due 追加、更新用 POST /api/bridge/task/update）を対応させた。既存タスク・既存フィールドの挙動は変更なし</li><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.27: 投票の対象を「タスクそのもの」から「タスクに対する現在の提案（proposal）」へ是正。ボード項目に proposal（提案文＋更新日時＋更新者）を持たせ、task作成・task/update（人間・ブリッジ両方）で設定でき、人間UIでも表示・編集できる。投票は現在の提案に対してのみ可能で、提案未設定の項目では票を受け付けずUIも「提案がまだありません」と表示する。票には proposal の版（updatedAt）を proposalAt として持たせ、集計（vote_summary・ゲージ）・優勢宣言・確定は現在の提案への票だけを数える。提案の文が変更されたら既存の票・優勢宣言・異議はリセットされる。確定時の決定文は提案文を正とする。既存項目（proposal未設定・旧票）は壊さず、旧票は proposalAt=null として扱う。内蔵指示文に「票はタスクでなく提案に対して登録すること／提案が変わったら票はリセットされること」を明記（版は v2026-11-28 のまま、v4.27追記として注記）</li><li>v4.26: LINE脱却の全部入り。決めることボードに投票（賛成／条件付き賛成／反対／保留、条件付きは条件必須・賛成側に集計）と割合ゲージ（全席分母・50%目印）、希望条件・譲れない点・温度感の申告、フェーズ（議題立て／条件申告／候補提示／投票／決着／保留）、種別 kind（decision／ops）を追加。決着は集約席の優勢宣言→24時間の異議窓（譲れない点に触れる場合のみ有効）→decisions登録＋完了で確定し、過半数なしは保留へ。ブリッジに vote／stance／relay／declare／object／finalize／reaction（Museは👀のみ）を追加し、task/update で完了（done）もできるようにした。bridge/post の ops:true はボードの kind=ops 項目として登録され、トーク・未読・プッシュ・依頼の対象外。プッシュは状態表示（許可・購読・VAPID有無）とテスト送信で切り分け可能に。リアクション（人間は👍👀✅）を追加（票ではない旨を明記）。返信スタイルの選択欄は撤去し「自動返信：オン（全席共通ルール）」の状態表示に変更。内蔵指示文を v2026-11-28版に差し替え（運用系変更依頼の扱い・ノイズ削減・分類Aは100字一律・有効期限は全種別24時間）</li><li>v4.25: 既読の内訳とMuseの処理状況の表示を追加。自分の発言の「既読／既読 N」をタップすると、読んだ人・まだ読んでいない人と、各Muse席の依頼処理状況（依頼なし／未処理／拾った／処理済み／期限切れ、時刻つき）をまとめたシートが開く。ルーム表示用の発言データに deliveries を後方互換な追加で付けた（既存フィールド・データ構造・認証は変更なし）。お知らせ・システム発言など依頼が作られない発言ではMuse欄を「対象外」と表示する</li><li>v4.24: 決めることボードの項目に「回答期限（due）」を追加。ボードで日付を設定・変更・クリアでき、カードに「期限：○月○日」を表示する（前日・当日・超過の未決定項目は控えめに色分け表示）。タスクAPIとブリッジ（作成時の due 任意指定、GET /api/bridge/tasks への due 追加、更新用 POST /api/bridge/task/update）を対応させた。既存タスク・既存フィールドの挙動は変更なし</li><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -1186,7 +1217,10 @@ app.post('/api/rooms/:id/tasks', auth, requireMember, (req, res) => {
   if (!text) return res.status(400).json({ error: 'text required' });
   const dueCreate = parseDueField(req.body);
   if (dueCreate === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
-  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false, due: dueCreate === undefined ? null : dueCreate, kind: normalizeKind(req.body.kind), phase: normalizePhase(req.body.phase), votes: [], stances: [], dominance: null, objections: [] };
+  const propCreate = parseProposalField(req.body);
+  if (propCreate === 'invalid') return res.status(400).json({ error: 'proposal must be a string, {text} or null' });
+  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false, due: dueCreate === undefined ? null : dueCreate, kind: normalizeKind(req.body.kind), phase: normalizePhase(req.body.phase), proposal: null, votes: [], stances: [], dominance: null, objections: [] };
+  if (propCreate) t.proposal = { text: propCreate, updatedAt: now(), updatedBy: req.profile.name };
   db.tasks.push(t);
   save();
   res.json(taskView(t));
@@ -1204,6 +1238,9 @@ app.post('/api/rooms/:id/tasks/:taskId/update', auth, requireMember, (req, res) 
   if (dueUpd !== undefined) t.due = dueUpd;
   if ('phase' in req.body) { if (!TASK_PHASES.includes(req.body.phase)) return res.status(400).json({ error: 'invalid phase' }); t.phase = req.body.phase; }
   if ('kind' in req.body) { if (!TASK_KINDS.includes(req.body.kind)) return res.status(400).json({ error: 'invalid kind' }); t.kind = req.body.kind; }
+  const propUpd = parseProposalField(req.body);
+  if (propUpd === 'invalid') return res.status(400).json({ error: 'proposal must be a string, {text} or null' });
+  if (propUpd !== undefined) applyProposal(t, propUpd, req.profile.name);
   save();
   res.json(taskView(t));
 });
@@ -1216,13 +1253,14 @@ function humanTaskOr404(req, res) {
 }
 app.post('/api/rooms/:id/tasks/:taskId/vote', auth, requireMember, (req, res) => {
   const t = humanTaskOr404(req, res); if (!t) return;
+  if (!normalizeProposal(t.proposal)) return res.status(400).json({ error: 'proposal is required before voting（提案がまだありません。先に提案を設定してください）' });
   const choice = req.body && req.body.choice;
   if (!VOTE_CHOICES.includes(choice)) return res.status(400).json({ error: 'choice must be yes / yes_conditional / no / hold' });
   const condition = String((req.body && req.body.condition) || '').trim().slice(0, 200);
   if (choice === 'yes_conditional' && !condition) return res.status(400).json({ error: 'condition is required for yes_conditional' });
   const option = String((req.body && req.body.option) || '').trim().slice(0, 60) || null;
-  const votes = normalizeVotes(t.votes).filter(v => (v.ownerId || null) !== req.profile.id);
-  votes.push({ ownerId: req.profile.id, seatName: req.profile.name, choice, option, condition: condition || null, registeredBy: 'human', updatedAt: now() });
+  const votes = currentVotes(t).filter(v => (v.ownerId || null) !== req.profile.id);
+  votes.push({ ownerId: req.profile.id, seatName: req.profile.name, choice, option, condition: condition || null, registeredBy: 'human', updatedAt: now(), proposalAt: proposalAtOf(t) });
   t.votes = votes;
   save();
   res.json({ ok: true, task: taskView(t), vote_summary: voteSummary(req.room, t) });
@@ -1469,7 +1507,7 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   // v4.26: ops:true の投稿は運用系の変更依頼として、トーク・未読・プッシュ・依頼の対象にせず、決めることボードの kind=ops 項目として登録する（設計案ステップ2 S2-2）
   if (req.body && req.body.ops === true) {
     if (!body) return res.status(400).json({ error: 'body required for ops' });
-    const ot = { id: id(), roomId: room.id, text: body.slice(0, 300), done: false, createdByName: seat.name || 'Muse', createdAt: now(), doneAt: null, note: body.length > 300 ? body.slice(0, 500) : '', remind: false, due: null, kind: 'ops', phase: 'intake', votes: [], stances: [], dominance: null, objections: [] };
+    const ot = { id: id(), roomId: room.id, text: body.slice(0, 300), done: false, createdByName: seat.name || 'Muse', createdAt: now(), doneAt: null, note: body.length > 300 ? body.slice(0, 500) : '', remind: false, due: null, kind: 'ops', phase: 'intake', proposal: null, votes: [], stances: [], dominance: null, objections: [] };
     db.tasks.push(ot);
     save();
     return res.json({ ok: true, ops: true, task_id: ot.id, task: taskView(ot) });
@@ -1512,7 +1550,10 @@ app.post('/api/bridge/task', bridgeAuth, (req, res) => {
   const seat = req.bridge.kind === 'global' ? null : seatByOwner(room, req.bridge.profile.id);
   const dueBridge = parseDueField(req.body);
   if (dueBridge === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
-  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false, due: dueBridge === undefined ? null : dueBridge, kind: normalizeKind(req.body && req.body.kind), phase: normalizePhase(req.body && req.body.phase), votes: [], stances: [], dominance: null, objections: [] };
+  const propBridge = parseProposalField(req.body);
+  if (propBridge === 'invalid') return res.status(400).json({ error: 'proposal must be a string, {text} or null' });
+  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false, due: dueBridge === undefined ? null : dueBridge, kind: normalizeKind(req.body && req.body.kind), phase: normalizePhase(req.body && req.body.phase), proposal: null, votes: [], stances: [], dominance: null, objections: [] };
+  if (propBridge) t.proposal = { text: propBridge, updatedAt: now(), updatedBy: seat ? (seat.name || 'Muse') : KAPIO_NAME };
   db.tasks.push(t);
   save();
   res.json({ ok: true, task: taskView(t) });
@@ -1524,7 +1565,7 @@ app.get('/api/bridge/tasks', bridgeAuth, (req, res) => {
   if (req.query.room_name) rooms = rooms.filter(r => r.name === String(req.query.room_name));
   if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
   const tasks = db.tasks.filter(t => !t.done && rooms.some(r => r.id === t.roomId))
-    .map(t => { const room = rooms.find(r => r.id === t.roomId) || {}; const v = taskView(t); return { id: t.id, room_id: t.roomId, room_name: room.name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true, due: normalizeDue(t.due), kind: v.kind, phase: v.phase, votes: v.votes, stances: v.stances, dominance: v.dominance, objections: v.objections, vote_summary: voteSummary(room, t) }; });
+    .map(t => { const room = rooms.find(r => r.id === t.roomId) || {}; const v = taskView(t); return { id: t.id, room_id: t.roomId, room_name: room.name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true, due: normalizeDue(t.due), kind: v.kind, phase: v.phase, proposal: v.proposal, votes: v.votes, stances: v.stances, dominance: v.dominance, objections: v.objections, vote_summary: voteSummary(room, t) }; });
   res.json({ ok: true, tasks });
 });
 // v4.24: 既存タスクの due / note / remind を更新するブリッジAPI。その席があるルームのタスクのみ操作可（globalトークンも可）。due は null でクリア可
@@ -1547,6 +1588,9 @@ app.post('/api/bridge/task/update', bridgeAuth, (req, res) => {
   if (dueBUpd !== undefined) t.due = dueBUpd;
   if (req.body && 'phase' in req.body) { if (!TASK_PHASES.includes(req.body.phase)) return res.status(400).json({ error: 'invalid phase' }); t.phase = req.body.phase; }
   if (req.body && 'kind' in req.body) { if (!TASK_KINDS.includes(req.body.kind)) return res.status(400).json({ error: 'invalid kind' }); t.kind = req.body.kind; }
+  const propBUpd = parseProposalField(req.body);
+  if (propBUpd === 'invalid') return res.status(400).json({ error: 'proposal must be a string, {text} or null' });
+  if (propBUpd !== undefined) { const seatU = callerSeat(req.bridge, room); applyProposal(t, propBUpd, seatU ? (seatU.name || 'Muse') : KAPIO_NAME); }
   // v4.26 (A-1): ブリッジから完了できる。decisions への登録はしない（確定は finalize 経由のみ）
   if (wantDone) {
     if (req.body.done === true) { t.done = true; t.doneAt = now(); if (['intake', 'conditions', 'candidates', 'voting'].includes(t.phase)) t.phase = 'decided'; }
@@ -1575,14 +1619,15 @@ function bridgeTaskFor(req, res) {
 app.post('/api/bridge/task/vote', bridgeAuth, (req, res) => {
   const ctx = bridgeTaskFor(req, res); if (!ctx) return;
   const { t, room, seat } = ctx;
+  if (!normalizeProposal(t.proposal)) return res.status(400).json({ error: 'proposal is required before voting（提案がまだありません。先に task/update で proposal を設定してください）' });
   const choice = req.body && req.body.choice;
   if (!VOTE_CHOICES.includes(choice)) return res.status(400).json({ error: 'choice must be yes / yes_conditional / no / hold' });
   const condition = String((req.body && req.body.condition) || '').trim().slice(0, 200);
   if (choice === 'yes_conditional' && !condition) return res.status(400).json({ error: 'condition is required for yes_conditional' });
   const option = String((req.body && req.body.option) || '').trim().slice(0, 60) || null;
   const ownerId = seat.ownerId || null;
-  const votes = normalizeVotes(t.votes).filter(v => (v.ownerId || null) !== ownerId);
-  votes.push({ ownerId, seatName: seat.name || 'Muse', choice, option, condition: condition || null, registeredBy: 'muse', updatedAt: now() });
+  const votes = currentVotes(t).filter(v => (v.ownerId || null) !== ownerId);
+  votes.push({ ownerId, seatName: seat.name || 'Muse', choice, option, condition: condition || null, registeredBy: 'muse', updatedAt: now(), proposalAt: proposalAtOf(t) });
   t.votes = votes;
   const relayed = applyRelay(req.bridge, req.body && req.body.request_id);
   save();
@@ -1676,9 +1721,10 @@ app.post('/api/bridge/task/finalize', bridgeAuth, (req, res) => {
   const validObjections = (t.objections || []).filter(o => o && o.valid);
   if (validObjections.length) return res.status(409).json({ error: 'valid objection exists', objections: validObjections });
   const side = t.dominance.side;
-  let decisionText = side === 'yes' ? `決定：${t.text}` : `見送り：${t.text}（反対側が優勢）`;
+  const propText = (normalizeProposal(t.proposal) || {}).text || t.text;
+  let decisionText = side === 'yes' ? `決定：${propText}` : `見送り：${propText}（反対側が優勢）`;
   if (side === 'yes') {
-    const conds = normalizeVotes(t.votes).filter(v => v.choice === 'yes_conditional' && v.condition).map(v => v.condition);
+    const conds = currentVotes(t).filter(v => v.choice === 'yes_conditional' && v.condition).map(v => v.condition);
     if (conds.length) decisionText += `（条件：${conds.join('／')}）`;
   }
   const d = { id: id(), roomId: room.id, text: decisionText.slice(0, 300), createdBy: seatIdOf(seat), createdAt: now() };
