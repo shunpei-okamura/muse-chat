@@ -99,18 +99,44 @@ function urlB64ToUint8(b64) {
   const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
   return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
 }
+// v4.26: プッシュの状態を握り潰さず保持し、「自分の情報」に表示する（許可／購読／サーバー設定の切り分け用）
+let pushStatus = { permission: ('Notification' in window ? Notification.permission : 'unsupported'), subscribed: false, vapidConfigured: null, error: null, checkedAt: null };
+function renderPushStatus() {
+  const el = $('#me-push-status');
+  if (!el) return;
+  const permLabel = { granted: '許可', denied: '拒否（ブラウザ設定で許可してください）', default: '未決定（通知を許可する操作が必要です）', unsupported: 'このブラウザは通知に未対応' }[pushStatus.permission] || pushStatus.permission;
+  const vapidLabel = pushStatus.vapidConfigured === null ? '未確認' : (pushStatus.vapidConfigured ? '設定あり' : '未設定（サーバー側の問題です）');
+  el.innerHTML = `通知の許可：${esc(permLabel)}<br>購読の登録：${pushStatus.subscribed ? '登録済み' : '未登録'}<br>サーバーのプッシュ設定：${esc(vapidLabel)}${pushStatus.error ? `<br>直近のエラー：${esc(pushStatus.error)}` : ''}`;
+}
+async function refreshPushStatus() {
+  pushStatus.permission = ('Notification' in window ? Notification.permission : 'unsupported');
+  try { const { key } = await api('/api/push/public-key'); pushStatus.vapidConfigured = !!key; } catch { /* 未確認のまま */ }
+  try {
+    if ('serviceWorker' in navigator && 'PushManager' in window) {
+      const reg = await navigator.serviceWorker.ready;
+      pushStatus.subscribed = !!(await reg.pushManager.getSubscription());
+    }
+  } catch { /* 購読状態は未登録扱い */ }
+  pushStatus.checkedAt = new Date().toISOString();
+  renderPushStatus();
+  return pushStatus;
+}
 async function subscribePush() {
   try {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    pushStatus.error = null;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { pushStatus.error = 'このブラウザはプッシュに未対応です'; renderPushStatus(); return; }
+    if (!('Notification' in window) || Notification.permission !== 'granted') { renderPushStatus(); return; }
     const { key } = await api('/api/push/public-key');
-    if (!key) return;
+    pushStatus.vapidConfigured = !!key;
+    if (!key) { pushStatus.error = 'サーバーにプッシュ設定（VAPID）がありません'; renderPushStatus(); return; }
     const reg = await navigator.serviceWorker.ready;
     let sub = await reg.pushManager.getSubscription();
     if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
     await api('/api/push/subscribe', { method: 'POST', body: JSON.stringify({ subscription: sub }) });
+    pushStatus.subscribed = true;
     pushActive = true;
-  } catch { /* push is best-effort */ }
+  } catch (e) { pushStatus.error = (e && e.message) || '購読に失敗しました'; }
+  renderPushStatus();
 }
 
 async function afterLogin() {
@@ -168,7 +194,7 @@ $('#create-submit').addEventListener('click', async (e) => {
   try {
     const room = await api('/api/rooms', {
       method: 'POST',
-      body: JSON.stringify({ name: $('#create-name').value.trim(), withKapio: $('#create-kapio').checked, kapioMode: $('#create-kapio-mode').value }),
+      body: JSON.stringify({ name: $('#create-name').value.trim(), withKapio: $('#create-kapio').checked }),
     });
     closeModal(e.target);
     await loadRooms();
@@ -190,6 +216,16 @@ $('#me-btn').addEventListener('click', async () => {
   $('#me-name').textContent = profile.name;
   try { const me = await api('/api/me'); $('#me-push-preview').checked = me.pushPreview !== false; } catch { /* ignore */ }
   openModal('#modal-me');
+  refreshPushStatus();
+});
+$('#me-push-test').addEventListener('click', async () => {
+  try {
+    if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
+    await subscribePush();
+    const r = await api('/api/push/test', { method: 'POST', body: '{}' });
+    alert(`テスト通知を送信しました（${r.sent}件）。端末に届くか確認してください`);
+  } catch (e) { alert('テスト通知を送れませんでした: ' + e.message); }
+  refreshPushStatus();
 });
 $('#me-push-preview').addEventListener('change', async (e) => {
   try { await api('/api/me/settings', { method: 'POST', body: JSON.stringify({ pushPreview: e.target.checked }) }); }
@@ -246,16 +282,72 @@ function boardOpenTasks() { return boardTasks.filter(t => !t.done); }
 // v4.24: 回答期限（due: 'YYYY-MM-DD' | null）の表示ヘルパー。日付の前後判定は端末のローカル日付で行う
 function boardTodayStr() { const d = new Date(); const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
 function boardDueInfo(t) { const due = (t && typeof t.due === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.due)) ? t.due : null; if (!due) return { due: null, label: '', cls: '', tag: '' }; const [, m, d] = due.split('-'); const label = `期限：${Number(m)}月${Number(d)}日`; const today = boardTodayStr(); const tom = new Date(); tom.setDate(tom.getDate() + 1); const p2 = (n) => String(n).padStart(2, '0'); const tomorrow = `${tom.getFullYear()}-${p2(tom.getMonth() + 1)}-${p2(tom.getDate())}`; if (due < today) return { due, label, cls: ' due-overdue', tag: '超過' }; if (due === today) return { due, label, cls: ' due-today', tag: '今日まで' }; if (due === tomorrow) return { due, label, cls: ' due-tomorrow', tag: '明日まで' }; return { due, label, cls: '', tag: '' }; }
+// ---------- v4.26: ボード拡張（投票・申告・フェーズ・kind・決着表示） ----------
+const PHASE_LABELS = { intake: '議題立て', conditions: '条件申告', candidates: '候補提示', voting: '投票', decided: '決着', parked: '保留' };
+const VOTE_LABELS = { yes: '賛成', yes_conditional: '条件付き賛成', no: '反対', hold: '保留' };
+const TEMP_LABELS = { high: '高', mid: '中', low: '低' };
+let boardKindFilter = 'all'; // 'all' | 'decision' | 'ops'
+function boardSeatTotal() {
+  const seats = (currentRoom && currentRoom.muses) || [];
+  return seats.length;
+}
+function boardVoteSummary(t) {
+  const votes = Array.isArray(t.votes) ? t.votes : [];
+  const total = Math.max(boardSeatTotal(), new Set(votes.map(v => v.ownerId || '__legacy__')).size, 1);
+  const yes = votes.filter(v => v.choice === 'yes').length;
+  const cond = votes.filter(v => v.choice === 'yes_conditional').length;
+  const no = votes.filter(v => v.choice === 'no').length;
+  const hold = votes.filter(v => v.choice === 'hold').length;
+  const unvoted = Math.max(0, total - votes.length);
+  return { total, yes, cond, yesSide: yes + cond, no, hold, unvoted };
+}
+function boardGaugeHtml(t) {
+  const s = boardVoteSummary(t);
+  const pct = (n) => (s.total ? (n / s.total) * 100 : 0);
+  return `<div class="board-gauge-wrap"><div class="board-gauge" role="img" aria-label="賛成側${s.yesSide}、反対${s.no}、未回答${s.hold + s.unvoted}、全${s.total}席">
+    <div class="gauge-seg gauge-yes" style="width:${pct(s.yes)}%"></div>
+    <div class="gauge-seg gauge-cond" style="width:${pct(s.cond)}%"></div>
+    <div class="gauge-seg gauge-no" style="width:${pct(s.no)}%"></div>
+    <div class="gauge-seg gauge-rest" style="width:${pct(s.hold + s.unvoted)}%"></div>
+    <div class="gauge-half" title="過半数の目印（50%）"></div>
+  </div>
+  <div class="board-gauge-counts">賛成側 ${s.yesSide}（賛成${s.yes}・条件付き${s.cond}）／反対 ${s.no}／未回答 ${s.hold + s.unvoted}（保留${s.hold}・未投票${s.unvoted}）／全${s.total}席</div></div>`;
+}
+function boardVotesHtml(t) {
+  const votes = Array.isArray(t.votes) ? t.votes : [];
+  if (!votes.length) return '<div class="board-votes-empty">票はまだありません</div>';
+  return `<div class="board-votes">${votes.map(v => `<div class="board-vote-line"><span class="vote-name">${esc(v.seatName || 'Muse')}${v.registeredBy === 'human' ? '（本人）' : ''}</span><span class="vote-choice vote-${esc(v.choice)}">${esc(VOTE_LABELS[v.choice] || v.choice)}</span>${v.option ? `<span class="vote-option">${esc(v.option)}</span>` : ''}${v.condition ? `<span class="vote-condition">条件：${esc(v.condition)}</span>` : ''}</div>`).join('')}</div>`;
+}
+function boardStancesHtml(t) {
+  const stances = Array.isArray(t.stances) ? t.stances : [];
+  const seats = (currentRoom && currentRoom.muses) || [];
+  const declaredOwners = new Set(stances.map(x => x.ownerId || '__legacy__'));
+  const undeclared = seats.filter(s => !declaredOwners.has(s.ownerId || '__legacy__')).map(s => s.name || 'Muse');
+  const temps = { high: 0, mid: 0, low: 0 };
+  for (const x of stances) if (temps[x.temperature] !== undefined) temps[x.temperature]++;
+  const lines = stances.map(x => `<div class="board-stance-line"><span class="stance-name">${esc(x.seatName || 'Muse')}${x.registeredBy === 'human' ? '（本人）' : ''}</span>${x.conditions ? `<span>希望：${esc(x.conditions)}</span>` : ''}${x.nonNegotiables ? `<span>譲れない点：${esc(x.nonNegotiables)}</span>` : ''}${x.temperature ? `<span class="stance-temp temp-${esc(x.temperature)}">温度感：${esc(TEMP_LABELS[x.temperature] || x.temperature)}</span>` : ''}</div>`).join('');
+  return `<div class="board-stances">${lines || '<div class="board-votes-empty">申告はまだありません</div>'}<div class="board-stance-summary">温度感：高${temps.high}・中${temps.mid}・低${temps.low}${undeclared.length ? `／未申告：${esc(undeclared.join('、'))}` : ''}</div></div>`;
+}
+function boardDominanceHtml(t) {
+  const d = t.dominance;
+  if (!d) return '';
+  const sideLabel = d.side === 'yes' ? '賛成側' : '反対側';
+  const statusLabel = { declared: '異議受付中', objected: '異議あり（決着停止）', finalized: '確定済み' }[d.status] || d.status;
+  const objs = (t.objections || []).filter(o => o && o.valid).map(o => `<div class="board-objection">異議：${esc(o.seatName || 'Muse')}「${esc(o.reason || '')}」（譲れない点：${esc(o.nonNegotiables || '')}）</div>`).join('');
+  return `<div class="board-dominance">🏁 優勢宣言：${esc(sideLabel)}（${esc(d.declaredBy || '集約席')}・${esc(uaTime(d.declaredAt))}）／${esc(statusLabel)}${d.status === 'declared' ? `／異議期限：${esc(uaTime(d.objectionDeadline))}` : ''}${objs}</div>`;
+}
 function renderBoard() {
-  const open = boardOpenTasks();
+  const openAll = boardOpenTasks();
+  const open = boardKindFilter === 'all' ? openAll : openAll.filter(t => (t.kind || 'decision') === boardKindFilter);
   for (const badge of [$('#board-badge'), $('#board-badge2')]) {
     if (badge) {
-      badge.textContent = String(open.length);
-      badge.classList.toggle('hidden', !open.length);
+      badge.textContent = String(openAll.length);
+      badge.classList.toggle('hidden', !openAll.length);
     }
   }
+  for (const b of document.querySelectorAll('.board-filter-btn')) b.classList.toggle('on', b.dataset.kind === boardKindFilter);
   const count = $('#board-count');
-  if (count) count.textContent = `未決定 ${open.length}件`;
+  if (count) count.textContent = `未決定 ${openAll.length}件`;
   const roomName = $('#board-room-name');
   if (roomName) roomName.textContent = currentRoom ? (currentRoom.name || '') : '';
   const list = $('#board-list');
@@ -268,7 +360,13 @@ function renderBoard() {
             : (t.note ? `<div class="board-note">📝 ${esc(t.note)}</div>` : '');
           const di = boardDueInfo(t);
           const dueBox = di.due ? `<div class="board-due${di.cls}">📅 ${esc(di.label)}${di.tag ? `（${esc(di.tag)}）` : ''}</div>` : '';
-          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${dueBox}${noteBox}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button><label class="board-due-edit">📅 期限 <input type="date" class="board-due-input" data-id="${esc(t.id)}" value="${esc(di.due || '')}"></label>${di.due ? `<button type="button" class="sub-btn board-due-clear" data-id="${esc(t.id)}">期限を消す</button>` : ''}</div></div>`;
+          const kindTag = (t.kind || 'decision') === 'ops' ? '<span class="board-kind-tag kind-ops">運用依頼</span>' : '';
+          const phaseSel = `<label class="board-phase">段階：<select class="board-phase-select" data-id="${esc(t.id)}">${Object.entries(PHASE_LABELS).map(([k, v]) => `<option value="${k}"${(t.phase || 'intake') === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>`;
+          const myVote = (Array.isArray(t.votes) ? t.votes : []).find(v => (v.ownerId || null) === (profile ? profile.id : null));
+          const voteBtns = `<div class="board-my-vote"><span class="board-my-vote-label">あなたの票：</span>${Object.entries(VOTE_LABELS).map(([k, v]) => `<button type="button" class="sub-btn board-vote-btn${myVote && myVote.choice === k ? ' on' : ''}" data-id="${esc(t.id)}" data-choice="${k}">${v}</button>`).join('')}</div>`;
+          const myStance = (Array.isArray(t.stances) ? t.stances : []).find(x => (x.ownerId || null) === (profile ? profile.id : null));
+          const stanceForm = `<div class="board-stance-form"><div class="board-stance-form-head">あなたの申告（ボードに公開されます）</div><input type="text" class="board-stance-cond" data-id="${esc(t.id)}" maxlength="500" placeholder="希望条件" value="${esc(myStance ? (myStance.conditions || '') : '')}"><input type="text" class="board-stance-nonneg" data-id="${esc(t.id)}" maxlength="500" placeholder="譲れない点" value="${esc(myStance ? (myStance.nonNegotiables || '') : '')}"><label>温度感：<select class="board-stance-temp" data-id="${esc(t.id)}"><option value="">未選択</option>${Object.entries(TEMP_LABELS).map(([k, v]) => `<option value="${k}"${myStance && myStance.temperature === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label><button type="button" class="sub-btn board-stance-save" data-id="${esc(t.id)}">申告を保存</button></div>`;
+          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${kindTag}${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${dueBox}${noteBox}${boardDominanceHtml(t)}${boardGaugeHtml(t)}${boardVotesHtml(t)}${voteBtns}${boardStancesHtml(t)}${stanceForm}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button><label class="board-due-edit">📅 期限 <input type="date" class="board-due-input" data-id="${esc(t.id)}" value="${esc(di.due || '')}"></label>${di.due ? `<button type="button" class="sub-btn board-due-clear" data-id="${esc(t.id)}">期限を消す</button>` : ''}${phaseSel}</div></div>`;
         }).join('')
       : '<div class="board-empty">未決定のものはありません。</div>';
     list.querySelectorAll('.board-done-btn').forEach(b => b.addEventListener('click', async () => {
@@ -316,6 +414,34 @@ function renderBoard() {
       if (!currentRoom) return;
       try { await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ due: null }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
     }));
+    list.querySelectorAll('.board-phase-select').forEach(sel => sel.addEventListener('change', async () => {
+      if (!currentRoom) return;
+      try { await api(`/api/rooms/${currentRoom.id}/tasks/${sel.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ phase: sel.value }) }); await loadBoardData(); } catch { /* 次回表示時に再取得 */ }
+    }));
+    list.querySelectorAll('.board-vote-btn').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      const choice = b.dataset.choice;
+      let condition = null;
+      if (choice === 'yes_conditional') {
+        condition = prompt('条件付き賛成の条件を短く書いてください（必須）');
+        if (!condition || !condition.trim()) return;
+      }
+      try {
+        await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/vote`, { method: 'POST', body: JSON.stringify({ choice, condition }) });
+        await loadBoardData();
+      } catch (e) { alert('票を登録できませんでした: ' + e.message); }
+    }));
+    list.querySelectorAll('.board-stance-save').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      const tid = b.dataset.id;
+      const cond = list.querySelector(`.board-stance-cond[data-id="${CSS.escape(tid)}"]`);
+      const nonneg = list.querySelector(`.board-stance-nonneg[data-id="${CSS.escape(tid)}"]`);
+      const temp = list.querySelector(`.board-stance-temp[data-id="${CSS.escape(tid)}"]`);
+      try {
+        await api(`/api/rooms/${currentRoom.id}/tasks/${tid}/stance`, { method: 'POST', body: JSON.stringify({ conditions: cond ? cond.value : '', non_negotiables: nonneg ? nonneg.value : '', temperature: temp && temp.value ? temp.value : null }) });
+        await loadBoardData();
+      } catch (e) { alert('申告を保存できませんでした: ' + e.message); }
+    }));
   }
   const decided = $('#board-decided');
   if (decided) {
@@ -324,6 +450,8 @@ function renderBoard() {
       : '';
   }
 }
+document.querySelectorAll('.board-filter-btn').forEach(b => b.addEventListener('click', () => { boardKindFilter = b.dataset.kind || 'all'; renderBoard(); }));
+
 async function loadBoardData() {
   if (!currentRoom) return;
   const detail = await api(`/api/rooms/${currentRoom.id}`);
@@ -367,7 +495,6 @@ function renderMuseBar() {
   if (!list || !currentRoom) return;
   const humans = (currentRoom.members || []).filter(m => !m.isMuse);
   const seats = currentRoom.muses || [];
-  const how = currentRoom.kapioMode === 'auto' ? '会話を見て自動で返信' : '名前を呼ばれたときだけ返信';
   let html = '<div class="members-head">参加者</div>';
   html += humans.length
     ? humans.map(m => `<div class="member-row"><span class="member-dot" style="background:${esc(m.color || '#999')}"></span><span>${esc(m.name)}${profile && m.id === profile.id ? '（自分）' : ''}</span></div>`).join('')
@@ -378,7 +505,7 @@ function renderMuseBar() {
       const p = PRESENCE_LABEL[s.presence] || PRESENCE_LABEL.offline;
       return `<div class="member-row"><span>🍸 ${esc(s.name)}${s.ownerName ? `（${esc(s.ownerName)}）` : '（Muse）'}</span><span class="presence"><i class="dot ${p.dot}"></i>${esc(p.text)}</span><button type="button" class="sub-btn call-seat-btn" data-seat="${esc(s.seatId)}">${esc(s.name)}を呼ぶ</button></div>`;
     }).join('');
-    html += `<div class="note">返信スタイル：${esc(how)}</div>`;
+    html += `<div class="note">自動返信：オン（全席共通ルール）</div>`;
   }
   list.innerHTML = html;
   list.querySelectorAll('.call-seat-btn').forEach(b => b.addEventListener('click', async () => {
@@ -531,6 +658,7 @@ function renderMessage(m) {
     <div class="msg-body">
       ${isMe ? '' : `<div class="msg-name">${esc(m.senderName)}${isKapio ? `（${esc(seatOwner || 'Muse')}）` : ''}</div>`}
       <div class="msg-bubble">${quoteHtml(m)}${m.image ? `<img class="msg-image" src="${esc(m.image)}" alt="画像">` : ''}${m.file ? `<a class="msg-pdf" href="#">📄 ${esc(m.file.name || 'PDFファイル')}</a>` : ''}${m.body ? `<span>${linkify(esc(m.body))}</span>` : ''}</div>
+      ${reactionsHtml(m)}
       <div class="msg-foot">${isMe ? `<span class="msg-read" id="read-${esc(m.id)}" title="既読の内訳とMuseの状況"></span>` : `<span class="msg-detail" title="既読の内訳とMuseの状況">詳細</span>`}<span class="msg-time">${fmtTime(m.createdAt)}${m.editedAt ? '（更新）' : ''}</span></div>
     </div>`;
   const img = row.querySelector('.msg-image');
@@ -543,9 +671,46 @@ function renderMessage(m) {
   if (readEl) readEl.addEventListener('click', () => openDetailSheet(m.id));
   const detailEl = row.querySelector('.msg-detail');
   if (detailEl) detailEl.addEventListener('click', () => openDetailSheet(m.id));
+  const addBtn = row.querySelector('.react-add');
+  if (addBtn) addBtn.addEventListener('click', () => openReactionPicker(m.id));
+  row.querySelectorAll('.react-chip').forEach(ch => ch.addEventListener('click', () => toggleReaction(m.id, ch.dataset.emoji)));
   attachLongPress(row.querySelector('.msg-bubble'), m.id);
   return row;
 }
+// ---------- v4.26: リアクション（人間は 👍👀✅。リアクションは票ではありません） ----------
+function reactionsHtml(m) {
+  const reactions = Array.isArray(m.reactions) ? m.reactions : [];
+  const counts = new Map();
+  for (const r of reactions) counts.set(r.emoji, (counts.get(r.emoji) || 0) + 1);
+  const chips = [...counts.entries()].map(([emoji, n]) => `<button type="button" class="react-chip" data-emoji="${esc(emoji)}" title="${esc(reactions.filter(r => r.emoji === emoji).map(r => r.name).join('、'))}">${esc(emoji)} ${n}</button>`).join('');
+  return `<div class="msg-reactions">${chips}<button type="button" class="react-add" title="リアクションを付ける">＋</button></div>`;
+}
+const reactionSheet = document.createElement('div');
+reactionSheet.className = 'sheet reaction-sheet hidden';
+reactionSheet.innerHTML = `<div class="sheet-card reaction-card">
+  <div class="reaction-btns"><button type="button" data-emoji="👍">👍</button><button type="button" data-emoji="👀">👀</button><button type="button" data-emoji="✅">✅</button></div>
+  <p class="note reaction-note">リアクションは票ではありません。賛否はボードの票で登録してください。</p>
+  <button type="button" data-act="cancel">キャンセル</button>
+</div>`;
+document.body.appendChild(reactionSheet);
+let reactionTargetId = null;
+function openReactionPicker(msgId) { reactionTargetId = msgId; reactionSheet.classList.remove('hidden'); }
+async function toggleReaction(msgId, emoji) {
+  if (!currentRoom || !emoji) return;
+  try {
+    const updated = await api(`/api/rooms/${currentRoom.id}/messages/${msgId}/reaction`, { method: 'POST', body: JSON.stringify({ emoji }) });
+    replaceMessage({ ...updated });
+  } catch (e) { alert('リアクションできませんでした: ' + e.message); }
+}
+reactionSheet.addEventListener('click', async (e) => {
+  if (e.target === reactionSheet || (e.target.dataset && e.target.dataset.act === 'cancel')) { reactionSheet.classList.add('hidden'); reactionTargetId = null; return; }
+  const emoji = e.target.dataset && e.target.dataset.emoji;
+  if (!emoji || !reactionTargetId) return;
+  const target = reactionTargetId;
+  reactionSheet.classList.add('hidden');
+  reactionTargetId = null;
+  await toggleReaction(target, emoji);
+});
 const dayKey = (iso) => { const d = new Date(iso); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
 const dayLabel = (iso) => new Date(iso).toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' });
 function appendMessage(m) {
@@ -662,6 +827,8 @@ function deliveryTimes(d) {
   if (d.handled_at) parts.push(`処理 ${fmtDateTime(d.handled_at)}`);
   if (d.status === 'pending' && d.expires_at) parts.push(`期限 ${fmtDateTime(d.expires_at)}`);
   if (d.status === 'expired' && d.expires_at) parts.push(`期限 ${fmtDateTime(d.expires_at)}`);
+  // v4.26: relay（オーナーへの取り次ぎ）申告。自己申告ベースである旨も添える
+  if ('relayed' in d) parts.push(d.relayed ? `取り次ぎ済み（申告ベース${d.relayed_at ? ' ' + fmtDateTime(d.relayed_at) : ''}）` : '取り次ぎ未（申告ベース）');
   return parts.join(' ・ ');
 }
 async function openDetailSheet(msgId) {
@@ -999,7 +1166,6 @@ $('#room-settings-btn').addEventListener('click', async () => {
   if (mine) {
     try { const t = await api('/api/me/bridge-token', { method: 'POST', body: '{}' }); $('#muse-token-input').value = t.bridgeToken; $('#muse-prompt').value = buildBridgePrompt(t.bridgeToken); } catch { /* ignore */ }
   }
-  $('#settings-kapio-mode').value = detail.kapioMode;
   renderDecisions(detail.decisions || []);
   renderTasks(detail.tasks || []);
   openModal('#modal-settings');
@@ -1061,14 +1227,17 @@ $('#muse-prompt-copy').addEventListener('click', async () => {
   catch { document.execCommand('copy'); alert('Museへの指示文をコピーしました'); }
 });
 // 自分のMuseにそのまま貼れる指示文（トークン・URL・自分の席の名前入り）
+// v4.26: 改訂版（指示文 v2026-11-28版）。ステップ1文案A〜F＋投票・申告・relay・フェーズ・決着・リアクションを取り込み、連絡の場はサブチャット方式に統一
+const PROMPT_VERSION = '指示文 v2026-11-28版／アプリ v4.26 付属';
 function buildBridgePrompt(token) {
-  const seat = (currentRoom?.muses || []).find(s => s.ownerId === profile.id);
-  const museName = seat ? seat.name : 'Muse';
-  const roomName = currentRoom ? currentRoom.name : '';
-  const origin = location.origin;
-  return `あなたはチャットアプリ「Muse対応チャット」のルーム「${roomName}」に、${museName}（${profile.name}さんのMuse）として同席します。オーナーがアプリを開かなくても会話に参加できるよう、次の手順でセットアップし、その後は振る舞いルールに従ってください。これはあなたへの指示の全文です（他に説明書はありません）。
+const seat = (currentRoom?.muses || []).find(s => s.ownerId === profile.id);
+const museName = seat? seat.name: 'Muse';
+const roomName = currentRoom? currentRoom.name: '';
+const origin = location.origin;
+return `あなたはチャットアプリ「Muse対応チャット」のルーム「${roomName}」に、${museName}（${profile.name}さんのMuse）として同席します。オーナーがアプリを開かなくても会話に参加できるよう、次の手順でセットアップし、その後は振る舞いルールに従ってください。これはあなたへの指示の全文です（他に説明書はありません）。
+${PROMPT_VERSION}
 
-【接続情報】
+
 連携トークン: ${token}
 APIのベースURL: ${origin}
 開発情報: ${origin}/dev（アプリのコードと変更手順のページ。不具合を調べるときは ${origin}/source/app.js のように本番コードを直接読める）
@@ -1076,54 +1245,86 @@ APIのベースURL: ${origin}
 オーナー: ${profile.name}さん
 このトークンはあなたの席専用です。他人に教えたり、オーナー以外の目に触れる場所（ファイルやスペースの表示など）に書いたりしないでください。
 
-【セットアップ】
+
 1. 接続テスト: GET ${origin}/api/bridge/pending（ヘッダー: Authorization: Bearer ${token}）を実行し、依頼の一覧（空でもよい）が返ることを確認する。401 の場合はトークンが違うのでオーナーに確認する。
-2. 見張り: 60秒間隔で GET ${origin}/api/bridge/pending を確認する仕組み（フック等）を作る。新しい request_id の依頼が現れたときだけ処理し、一度処理を始めた依頼で繰り返し起きないよう、処理したIDを記録する。オーナーの回答待ちの依頼は pending のまま残って正常。
-3. 連絡スペース: オーナー専用のスペース「${roomName} 連絡スペース」を作る。他人に共有しない。既に同じ名前のスペースを作ってある場合は、新規に作らず既存のものを使い続ける（スペースは1つに固定する）。Museアプリのチャット画面のようなUI（あなたの発言は左寄せの吹き出し、オーナーは右寄せの吹き出し、画面下部にメッセージ入力欄）で、オーナーへの質問・返信の下書き・自動返信のログを吹き出しとして時系列に流す。オーナーは吹き出し下の［このまま送信］［見送る］ボタンか、入力欄への返信で承認・回答できる。データはスペース側に保存し、あなたが登録・更新する。アイテムの項目: 種類（question/draft/post）、状態（waiting/approved/sent/skipped）、ルーム名、ルームID、request_id、きっかけの発言、会話の抜粋、下書き本文、質問文、見立て、オーナーの回答・編集文、作成時刻、期限。オーナーが入力欄で「ルームへ投稿」を選んで書いた文は、種類 post のアイテムとして作成時点から approved で保存される（あなたが次に起きたときに投稿する）。
+2. 見張り: GET ${origin}/api/bridge/pending を確認する仕組み（フック等）を作る。間隔は「自分の返信後10分間は15秒に1回／通常時は15分に1回／25:00〜9:00は巡回しない」。新しい request_id の依頼が現れたときだけ処理し、一度処理を始めた依頼で繰り返し起きないよう、処理したIDを記録する。オーナーの回答待ちの依頼は pending のまま残って正常。
+3. 連絡の場: オーナーとの連絡は、あなたとオーナーの普段のチャット（連絡サブチャット）で行う。オーナーへの質問・返信の下書き・自動返信のログは、連絡サブチャットへ時系列に流し、オーナーはそこで承認・回答できる。専用のスペースや承認コンソールのような別UIは作らない。
 
-【依頼の形式】
-各依頼: request_id / type（reply=返信、summary=要約、group=全体宛の相談）/ room_id / room_name / muse_name（あなたの名前）/ trigger（きっかけの発言）/ context（直近の会話）/ decisions / summary。有効期限は30分（group依頼と、仮答を出した依頼は24時間）。古いものから処理する。
 
-【処理の流れ】
-新しい依頼の前に、連絡スペースで approved になっているアイテムがあれば、その内容を POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "body": "..."}）で投稿して送信済みに記録する。skipped のアイテムの依頼が残っていれば POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じる。種類が post の approved アイテムがあれば、POST ${origin}/api/bridge/post {"room_id": "アイテムのルームID", "body": "投稿文"} でルームへ投稿して送信済みに記録する（post の文はオーナーが書いた原文のまま送り、書き換えない。ルームIDが分からない場合は room_id の代わりに room_name でも送れる）。その後、新しい依頼を以下に分類する。
+各依頼: request_id / type（reply=返信、summary=要約、group=全体宛の相談）/ room_id / room_name / muse_name（あなたの名前）/ trigger（きっかけの発言）/ context（直近の会話）/ decisions / summary。有効期限は全種別24時間です。古いものから処理してください。
 
-分類A（自動で返信してよい）: 挨拶・相づち・あなた自身への軽い質問への短答・オーナーが公言済みの事実の短い再掲。目安100字以内。約束・判断・予定の確定を含まない。人間の発言にも、他のMuseの発言にも反応してよい。POST ${origin}/api/bridge/typing {"request_id": "..."} で受け取りを記録し、reply で送信し、連絡スペースにログとして残す。
 
-分類Q（質問への回答: 仮答→オーナー確認→本答）: あなた宛の質問（特にオーナーの事情・意向が絡むもの、確信が持てないもの）は即答しない。(1) reply に {"request_id": "...", "body": "おそらく○○だと思うけど、${profile.name}さんに聞いてみるね", "partial": true} を送り、仮答を表示する（○○はあなたの見立て）。(2) 連絡スペースに質問を登録し、オーナーに普段のチャットでも知らせる。(3) オーナーの回答を受けたら、それを本答として partial なしの reply で送る（仮答の吹き出しが本答に置き換わる）。
+新しい依頼を処理する前に、オーナーから承認・回答が来ている下書きや投稿があれば、それを先に送る。承認された返信は POST ${origin}/api/bridge/reply（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "body": "..."}）で投稿する。見送られた依頼は POST ${origin}/api/bridge/dismiss {"request_id": "..."} で閉じる。オーナーが自分で書いた投稿文は、POST ${origin}/api/bridge/post {"room_id": "ルームID", "body": "投稿文"} で原文のまま送る（room_id の代わりに room_name でも送れる）。その後、新しい依頼を以下に分類する。分類の前に、まず「運用系の変更依頼」に当たるかを確認する（次節）。
 
-分類B（下書きを作り、オーナーの承認を得てから送る）: 意見・提案・判断を含む返信、約束・日程・お金・第三者の予定に触れる内容、調べた情報の共有、長文の返信、summary依頼（body に要約文、決まったことがあれば decisions に文字列の配列）。下書きを連絡スペースに登録してオーナーに知らせる。承認されたら reply で送る。オーナーが普段のチャットで「送っていい」と言った場合も送ってよい。
 
-分類G（全体宛の相談: type=group）: 特定の誰か宛ではなく全体への相談（日程調整など）。ルームへ即答も仮答もしない。オーナーに取り次ぐ: 連絡スペースに質問として登録し、オーナーに普段のチャットでも知らせる。オーナーの回答が得られたら、それをもとに reply で送る（例:「○日と○日なら空いてるよ」）。回答が得られなければ送らない。日程の確定や約束はしない（都合の集計まで）。
+次に当たる発言は、会話への返答ではなく「運用系の変更依頼」として扱ってください: お知らせの文面・出し方の変更／指示文の文面・ルールの変更／デプロイ報告・アップデート告知への修正／ルーム設定・運用ルールの変更／改善要望・不具合報告のうち設定変更や実装で解決するもの。扱いは次のとおりです（分類Cの特殊形です。新しい分類記号は作りません）:
+1. ルームへは返信しません。仮答・相づち・受領表明も送りません。
+2. verdict は、オーナーの判断がまだ要る間だけ needs_answer=true（題名は「運用依頼：○○」の形）とし、判断が出た時点で needs_answer=false に登録し直してください。判断済み・実施だけのものは最初から false です。
+3. 決めることボードへの登録は集約席（カピお）だけが行います。他の席は登録せず、dismiss で閉じてください。集約席は登録前に GET ${origin}/api/bridge/tasks で同趣旨の未完了項目がないか確認し、あれば新規登録せず既存に寄せてください。カピおの席がないルームでは、最初に処理した席が同じ手順で登録してください。
+4. 登録する文には、元の発言者・日時・依頼の要旨を含めてください。種別は kind=ops で登録します（POST ${origin}/api/bridge/task の本文に "kind": "ops" を付ける）。
+5. 自分のオーナーへは連絡サブチャットで軽く知らせるだけにしてください（全文転送はしない）。実施してよい範囲（小さな改善は対応可／仕様・データ構造・認証・削除・課金は承認が必要）は、従来の取り決めどおりです。
+6. 自分から運用系の変更依頼を出すときは、トークへ通常投稿せず、POST ${origin}/api/bridge/post の本文に "ops": true を付けてください（トーク欄に出ず、未読・プッシュ・依頼の対象にもならず、ボードに kind=ops の項目として登録されます）。
+7. 運用依頼かどうか確信が持てない場合は、この扱いを適用せず、従来の分類（迷ったらB）で処理してください。通常の相談を運用依頼と誤って握り潰さないためです。
+
+分類A（自動で返信してよい）: 自分宛の挨拶への返答／あなた自身への軽い質問への短答／オーナーが公言済みの事実の短い再掲だけです。目安100字以内で、全席一律です（席やオーナーごとに広げないでください。自動返信ルールは全体一律が正式仕様です）。約束・判断・予定の確定を含まないこと。相づちだけの返信は送りません（次節のノイズ削減も参照）。POST ${origin}/api/bridge/typing {"request_id": "..."} で受け取りを記録し、reply で送信し、連絡サブチャットにログとして残す。
+
+分類Q（質問への回答: 仮答→オーナー確認→本答）: あなた宛の質問（特にオーナーの事情・意向が絡むもの、確信が持てないもの）は即答しない。(1) reply に {"request_id": "...", "body": "おそらく○○だと思うけど、${profile.name}さんに聞いてみるね", "partial": true} を送り、仮答を表示する（○○はあなたの見立て）。(2) 連絡サブチャットでオーナーに質問を知らせる。(3) オーナーの回答を受けたら、それを本答として partial なしの reply で送る（仮答の吹き出しが本答に置き換わる）。
+
+分類B（下書きを作り、オーナーの承認を得てから送る）: 意見・提案・判断を含む返信、約束・日程・お金・第三者の予定に触れる内容、調べた情報の共有、長文の返信、summary依頼（body に要約文、決まったことがあれば decisions に文字列の配列）。下書きを連絡サブチャットでオーナーに見せて知らせる。承認されたら reply で送る。オーナーが普段のチャットで「送っていい」と言った場合も送ってよい。
+
+分類G（全体宛の相談: type=group）: 特定の誰か宛ではなく全体への相談（日程調整など）。ルームへ即答も仮答もしない。オーナーに取り次ぐ: 連絡サブチャットでオーナーに知らせる。オーナーの回答が得られたら、それをもとに reply で送る（例:「○日と○日なら空いてるよ」）。回答が得られなければ送らない。日程の確定や約束はしない（都合の集計まで）。
 
 分類C（返さない）: 関係が薄い、既に他の人が答えた、話題が流れた。dismiss で閉じる。迷ったらBに倒す。
 
-【未回答の判定登録（verdict）: 分類したら必ず登録する】
+日程がらみの質問・相談（Q/G）では、下書きを作る前にオーナーのカレンダー（Googleカレンダー等、連携しているもの）の空きを確認し、空いている候補日を下書きに入れること。
+
+特例（コウの扱い）: コウについては、名指しされていない発言でも、コウの日程・お金・担当に関わる内容であれば、ハッピーにも宛先として届いたものとして扱うこと。ハッピーはそれを自分宛の依頼として分類・対応する（雑談・感想など、日程・お金・担当に関わらない発言は対象外）。他の席は、同じ発言について重ねて担当しないこと。
+
+
 アプリの「未回答」表示（件数と一覧）は、この判定で決まります。依頼を分類したら、POST ${origin}/api/bridge/verdict（ヘッダー: Authorization: Bearer ${token}、本文 {"request_id": "...", "needs_answer": true/false, "title": "題名"}）で登録してください。再登録で上書きできます（分類が変わったら登録し直す）。
 - needs_answer=true（分類B・Q・G: オーナーの承認・回答が要るもの）: title に内容が分かる題名を付ける（例:「クリスマスパーティーの日程について」）。一覧ではこの題名が主表示になります。
 - 物差しは「オーナーの回答・判断がまだ要るか」だけです。設定変更や実装で解決するものは、オーナーの判断が出た時点で needs_answer=false に登録し直し、進捗はルームの「決めること（タスク）」で追ってください（未回答には残さない）。
-- needs_answer=false（分類A: 自分で回答済み／分類C: 回答不要）: title は不要です。要回答でないものは未回答表示に出ません。
+- needs_answer=false（分類A: 自分で回答済み／分類C: 回答不要／運用系の変更依頼で判断不要のもの）: title は不要です。要回答でないものは未回答表示に出ません。
 判定を付けていない依頼は未回答表示に出ません。処理の最後に判定まで済ませてください。
 
-【お知らせ（notice）】
-アップデート告知など、会話ではない連絡は「お知らせ」として届きます。GET /api/bridge/pending の応答の notices に入っているので、起きたら必ず目を通し、指示（指示文の取り直し等）があれば従ってください。お知らせへの返信は不要です。
-逆に、自分がアップデート告知などを出すときは、POST /api/bridge/post の本文に "notice": true を付けてください（トーク欄に出ず、お知らせとして配信されます）。
 
-【ループ防止（Aの前に必ず確認。contextの直近発言で判定）】
+アップデート告知など、会話ではない連絡は「お知らせ」として届きます。GET /api/bridge/pending の応答の notices に入っているので、起きたら必ず目を通し、指示（指示文の取り直し等）があれば従ってください。お知らせへの返信は不要です。
+逆に、自分がアップデート告知などを出すときは、POST /api/bridge/post の本文に "notice": true を付けてください（トーク欄に出ず、未読・プッシュ・依頼の対象にもなりません）。
+
+
+1. 相槌だけの返信は送らないでください。分類Aで自動返信してよいのは、自分宛の挨拶への返答／自席への軽い質問の短答／オーナーが公言済みの事実の短い再掲だけです（目安100字以内）。
+2. 決めることに関わる発言への賛否・条件・温度感は、文章で返信せず、決めることボードへの票・申告で表してください（次節）。
+3. 決定に関係ない雑談・感想への反応は、オーナーとの連絡サブチャット側で完結させ、ルームへは自動返信しないでください。
+4. 例外: Qの仮答と本答、お知らせ、候補の比較表、週次の未決一覧は、従来どおりルームへ出して構いません。
+
+
+議論も投票も決着もアプリの中で完結させます。項目は POST ${origin}/api/bridge/task（本文 {"room_id": "...", "text": "...", "due": "YYYY-MM-DD"（任意）, "kind": "decision"（運用依頼は "ops"）, "phase": "intake"（任意）}）で立て、GET ${origin}/api/bridge/tasks で未完了項目（票・申告・フェーズ・集計つき）を確認します。項目の更新は POST ${origin}/api/bridge/task/update（本文 {"task_id": "...", "note": "...", "due": "...", "remind": true, "phase": "...", "done": true}）で、done=true で完了にできます（decisions への登録は finalize 経由のみ）。
+- フェーズ: intake（議題立て）→ conditions（条件申告）→ candidates（候補提示）→ voting（投票）→ decided（決着）／parked（保留）。進行管理と決着の宣言は集約席（カピお）が担い、各席は自分のオーナーの申告と票に責任を持ちます。Muse同士の議論はトークの応酬ではなく、申告の更新と note の整理で行ってください。
+- 申告: オーナーへ取り次いだ結果を POST ${origin}/api/bridge/task/stance（本文 {"task_id": "...", "conditions": "希望条件", "non_negotiables": "譲れない点", "temperature": "high|mid|low"}）で登録します。全てボードに公開されるので、登録前に「この内容をボードに出していいか」をオーナーに確認し、事情の詳細ではなく結論だけを出してください。聞いていないのに見立てで申告しないこと。
+- 投票: オーナー本人の言葉で賛否を確認してから POST ${origin}/api/bridge/task/vote（本文 {"task_id": "...", "choice": "yes|yes_conditional|no|hold", "option": "候補名（任意）", "condition": "条件付き賛成の条件（yes_conditional では必須）"}）で登録します。相槌や「いいね」等の発言は票になりません。推測で票を入れないこと。票を登録したら、その項目について回答待ちだった依頼は verdict で needs_answer=false に登録し直してください。
+- 取り次ぎ（relay）: オーナーへ取り次いだら POST ${origin}/api/bridge/relay（本文 {"request_id": "...", "relayed": true}）で申告します。vote / stance の本文に "request_id" を付けると、その依頼への relay 申告も同時に行われます。relay は自己申告であり、表示も申告ベースとして扱われます。
+- 決着（集約席のみ）: 票の集計は、分母が全席で、賛成側=yes+yes_conditional、反対=no、hold はどちらにも数えません。どちらかが全席の過半数（>50%）に達したら、集約席は POST ${origin}/api/bridge/task/declare（本文 {"task_id": "...", "side": "yes|no"}）で優勢を宣言します（期限前でも、全席投票済み等で結果が覆らない場合は宣言してよい）。宣言から24時間は異議の窓です。異議は「自分の譲れない点（stance の non_negotiables）に触れる」場合のみ有効で、POST ${origin}/api/bridge/task/object（本文 {"task_id": "...", "reason": "理由", "reopen": "parked|conditions"（任意）}）で申し立てます。有効な異議があれば決着は止まり、項目は保留（parked）か条件申告へ戻ります。窓を過ぎて異議が無ければ、集約席が POST ${origin}/api/bridge/task/finalize（本文 {"task_id": "..."}）で確定します（decisions へ登録され、項目は完了になります。条件付き賛成の条件は決定文に付記されます）。どちらも過半数に達しなければ決着を宣言せず、task/update で phase を parked にし、note に理由と再開条件を残してください。
+
+
+発言への「見た」の印は、POST ${origin}/api/bridge/reaction（本文 {"message_id": "...", "emoji": "👀"}）で付けられます。Museが付けられるのは 👀 のみです。リアクションは票ではありません。賛否の代わりに使わないでください。
+
+
 1. 自席の発言が2回続いている（間に人間の発言がない）→ 自動返信しない（Cにする）。
 2. 直近の自分の通常の自動返信から3分未満 → 自動返信しない。ただしQの仮答は起点にしない。
 3. 相づちのみ（短文で「うん」「いいね」「確かに」等だけ）の発言へは自動応答しない。ただし自分宛の挨拶はAでよい。
 4. 人間の発言がないままMuse同士の往復が4発言以上続いている → そのルームでは自動返信を止め、Cにする。
 5. オーナーが「黙って」「止めて」と言ったら、その場で自動返信をやめる。
 
-【口調と安全】
+
 このルームは代理人モデルで運用されます。オーナーはルームに直接返信しない前提で、質問・回答・相談の取り次ぎはあなたが担います。発言は「${museName}」の名前で投稿されます。口調はオーナーの普段の話し方に合わせ、知らないことは知らないと言う。人間関係の約束を勝手に作らない。このルームでは全ての人間の発言が各席への依頼になります。特定の席やメンバーが名指しされた発言は、その席にだけ依頼が届きます。オーナーが名指しされた質問は、あなた自身への質問として受け止め、回答は代理人として自分の言葉で書くこと（「○○さんによると」のような伝聞調にしない）。`;
 }
+
 $('#settings-save').addEventListener('click', async (e) => {
   if (!currentRoom) return;
   try {
     await api(`/api/rooms/${currentRoom.id}/settings`, {
       method: 'POST',
-      body: JSON.stringify({ name: $('#settings-name').value.trim(), kapioMode: $('#settings-kapio-mode').value }),
+      body: JSON.stringify({ name: $('#settings-name').value.trim() }),
     });
     closeModal(e.target);
     reloadCurrentRoom();

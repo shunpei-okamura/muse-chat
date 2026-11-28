@@ -218,3 +218,44 @@ button:focus-visible { outline: 2px solid #0984e3; outline-offset: 2px; }
 .detail-line { display: flex; justify-content: space-between; gap: 8px; }
 .detail-status { font-weight: 600; color: #6b5a1e; white-space: nowrap; }
 .detail-times { font-size: 12px; color: #888; }
+
+/* v4.26: board gauge / votes / stances / phase / kind / reactions / push status */
+.board-filter { display: flex; gap: 6px; margin: 8px 0 2px; }
+.board-filter-btn.on { background: #ffedb5; border-color: #d4a017; font-weight: 600; }
+.board-kind-tag { display: inline-block; background: #e8f0fe; color: #1a56db; border: 1px solid #b8ccf5; border-radius: 6px; font-size: 11px; padding: 1px 6px; margin-right: 6px; vertical-align: 2px; }
+.board-gauge-wrap { margin-top: 8px; }
+.board-gauge { position: relative; display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: #e8e8e8; border: 1px solid #d5dbe1; }
+.gauge-seg { height: 100%; }
+.gauge-yes { background: #2fbf71; }
+.gauge-cond { background: repeating-linear-gradient(45deg, #2fbf71 0 6px, #a9e7c8 6px 12px); }
+.gauge-no { background: #e17055; }
+.gauge-rest { background: #cfd6dd; }
+.gauge-half { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: #333; opacity: .65; }
+.board-gauge-counts { font-size: 12px; color: #555; margin-top: 3px; }
+.board-votes, .board-stances { margin-top: 6px; font-size: 13px; }
+.board-vote-line, .board-stance-line { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
+.vote-name, .stance-name { font-weight: 600; }
+.vote-choice { border-radius: 6px; padding: 0 6px; background: #eef1f4; }
+.vote-yes, .vote-yes_conditional { background: #e2f7ea; color: #137a3f; }
+.vote-no { background: #fdecea; color: #b03a2e; }
+.vote-hold { background: #fff4d6; color: #8a6d1a; }
+.vote-condition { color: #137a3f; }
+.board-votes-empty { font-size: 12px; color: #999; padding: 2px 0; }
+.board-stance-summary { font-size: 12px; color: #777; margin-top: 2px; }
+.stance-temp.temp-high { color: #d35400; font-weight: 600; }
+.stance-temp.temp-low { color: #5b7a99; }
+.board-my-vote { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+.board-my-vote-label { font-size: 12px; color: #777; }
+.board-vote-btn.on { background: #dff5e6; border-color: #2fbf71; font-weight: 600; }
+.board-stance-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; background: #fffdf4; border: 1px dashed #e8d48b; border-radius: 8px; padding: 6px 8px; }
+.board-stance-form-head { width: 100%; font-size: 12px; color: #8a6d1a; font-weight: 600; }
+.board-stance-form input[type="text"] { flex: 1 1 140px; font-size: 13px; padding: 5px 6px; }
+.board-phase select, .board-stance-form select { font-size: 13px; padding: 3px 4px; }
+.board-dominance { margin-top: 8px; background: #eef7ee; border: 1px solid #9ccc9c; border-radius: 8px; padding: 6px 8px; font-size: 13px; }
+.board-objection { margin-top: 4px; color: #922b21; }
+.msg-reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; align-items: center; }
+.react-chip { background: #fff; border: 1px solid #d5dbe1; border-radius: 999px; padding: 1px 8px; font-size: 12px; cursor: pointer; }
+.react-add { background: transparent; border: 1px dashed #c3ccd4; color: #888; border-radius: 999px; width: 22px; height: 22px; font-size: 13px; line-height: 1; cursor: pointer; }
+.reaction-btns { display: flex; gap: 8px; justify-content: center; }
+.reaction-btns button { font-size: 26px; padding: 10px 18px; }
+.reaction-note { text-align: center; }

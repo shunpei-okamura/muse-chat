@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<link rel="stylesheet" href="/style.css?v=4.25">
+<link rel="stylesheet" href="/style.css?v=4.26">
 </head>
 <body>
 
@@ -97,6 +97,11 @@
   <div class="board-scroll">
     <p class="board-notice">ルーム発の決めること・改善の正はこのタスク表です（台帳完成までの暫定。設計 v0.3 §9）。他の置き場にはリンクだけ置き、状態はここで管理します。</p>
     <div class="board-head"><span>まだ決まっていない</span><span id="board-count" class="board-count"></span></div>
+    <div id="board-filter" class="board-filter">
+      <button type="button" class="sub-btn board-filter-btn on" data-kind="all">すべて</button>
+      <button type="button" class="sub-btn board-filter-btn" data-kind="decision">決めること</button>
+      <button type="button" class="sub-btn board-filter-btn" data-kind="ops">運用依頼</button>
+    </div>
     <div id="board-list"></div>
     <div id="board-decided"></div>
   </div>
@@ -132,11 +137,7 @@
     <h2>ルームを作る</h2>
     <label>ルーム名<input id="create-name" type="text" maxlength="50" placeholder="例：週末の予定"></label>
     <label class="check"><input id="create-kapio" type="checkbox" checked> Museの席を用意する</label>
-    <label>Museの返信スタイル
-      <select id="create-kapio-mode" disabled>
-        <option value="auto" selected>会話を見て自動で返信</option>
-      </select>
-    </label>
+    <p class="note">自動返信：オン（全席共通ルール。返信のルールは指示文で全席一律に定めています）</p>
     <div class="modal-btns">
       <button class="sub-btn" data-close>キャンセル</button>
       <button id="create-submit" class="primary-btn small">作成</button>
@@ -172,6 +173,7 @@
           <input id="muse-token-input" type="text" readonly>
           <button id="muse-token-copy" class="sub-btn">コピー</button>
         </div>
+        <p class="note">指示文 v2026-11-28版／アプリ v4.26 付属</p>
         <p class="note">Museへの指示文（トークン入り）。これをコピーして自分のMuseに貼るだけで、見張りと返信の設定が一度で済みます:</p>
         <textarea id="muse-prompt" readonly rows="10"></textarea>
         <button id="muse-prompt-copy" class="sub-btn">指示文をコピー</button>
@@ -179,12 +181,13 @@
         <button id="muse-release-btn" class="sub-btn">同席をやめる</button>
       </div>
     </div>
-    <label>Museの返信スタイル
-      <select id="settings-kapio-mode" disabled>
-        <option value="auto" selected>会話を見て自動で返信</option>
-      </select>
-    </label>
     <div class="summary-box">
+      <h3>自動返信</h3>
+      <p class="summary-text">自動返信：オン（全席共通ルール）</p>
+      <details>
+        <summary>共通ルールの要約</summary>
+        <p class="note">返信の分類（A／Q／B／G／C）と未回答の判定は、全席が同じ指示文（版は同席欄に表示）に従います。席ごとに変える設定はありません。個別の事情（黙ってほしい等）は、自分のMuseとの取り決めで吸収します。運用系の変更依頼はトークに返信せず、ボードの運用依頼として扱います。決めることへの賛否・条件・温度感は、文章ではなくボードの票・申告で表します。</p>
+      </details>
     </div>
     <div class="modal-btns">
       <button class="sub-btn" data-close>閉じる</button>
@@ -201,6 +204,12 @@
     <p class="note">この端末のブラウザに保存された情報で識別しています。別の端末では別の参加者として入ります。</p>
     <label class="check"><input id="me-push-preview" type="checkbox" checked> 通知にメッセージの本文を表示する</label>
     <p class="note">オフにすると、通知には「新着メッセージがあります」とだけ表示されます。届いた通知は、送信取消をしても端末からは消えません。</p>
+    <div class="summary-box">
+      <h3>プッシュ通知の状態</h3>
+      <p id="me-push-status" class="summary-text">確認中…</p>
+      <button id="me-push-test" type="button" class="sub-btn">テスト通知を送る</button>
+      <p class="note">届かないときは、上の状態（許可・購読・サーバー設定）を順に確認してください。iPhoneはホーム画面に追加したアプリから開いている必要があります。</p>
+    </div>
     <div class="modal-btns">
       <button class="sub-btn" data-close>閉じる</button>
     </div>
@@ -218,6 +227,6 @@
   </div>
 </div>
 
-<script src="/app.js?v=4.25"></script>
+<script src="/app.js?v=4.26"></script>
 </body>
 </html>
