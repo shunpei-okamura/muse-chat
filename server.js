@@ -51,6 +51,85 @@ function isValidDue(v) { return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.t
 function normalizeDue(v) { return isValidDue(v) ? v : null; }
 // リクエストボディの due を解釈する。キーが無ければ undefined（変更しない）、null/'' はクリア(null)、有効な日付文字列はその値、それ以外は 'invalid'
 function parseDueField(body) { if (!body || !('due' in body)) return undefined; const v = body.due; if (v === null || v === '') return null; return isValidDue(v) ? v : 'invalid'; }
+// ---------- v4.26: 投票・申告・フェーズ・種別・決着・リアクション ----------
+const TASK_PHASES = ['intake', 'conditions', 'candidates', 'voting', 'decided', 'parked'];
+const TASK_KINDS = ['decision', 'ops'];
+const VOTE_CHOICES = ['yes', 'yes_conditional', 'no', 'hold'];
+const STANCE_TEMPS = ['high', 'mid', 'low'];
+const HUMAN_REACTIONS = ['👍', '👀', '✅'];
+const MUSE_REACTIONS = ['👀'];
+const normalizePhase = (v) => (TASK_PHASES.includes(v) ? v : 'intake');
+const normalizeKind = (v) => (TASK_KINDS.includes(v) ? v : 'decision');
+function normalizeVotes(v) {
+  if (!Array.isArray(v)) return [];
+  return v.filter(x => x && VOTE_CHOICES.includes(x.choice)).map(x => ({
+    ownerId: x.ownerId || null, seatName: String(x.seatName || 'Muse').slice(0, 40),
+    choice: x.choice, option: x.option ? String(x.option).slice(0, 60) : null,
+    condition: x.condition ? String(x.condition).slice(0, 200) : null,
+    registeredBy: x.registeredBy === 'human' ? 'human' : 'muse',
+    updatedAt: x.updatedAt || null,
+  }));
+}
+function normalizeStances(v) {
+  if (!Array.isArray(v)) return [];
+  return v.filter(x => x && typeof x === 'object').map(x => ({
+    ownerId: x.ownerId || null, seatName: String(x.seatName || 'Muse').slice(0, 40),
+    conditions: x.conditions ? String(x.conditions).slice(0, 500) : '',
+    nonNegotiables: x.nonNegotiables ? String(x.nonNegotiables).slice(0, 500) : '',
+    temperature: STANCE_TEMPS.includes(x.temperature) ? x.temperature : null,
+    registeredBy: x.registeredBy === 'human' ? 'human' : 'muse',
+    updatedAt: x.updatedAt || null,
+  }));
+}
+function normalizeReactions(v) {
+  if (!Array.isArray(v)) return [];
+  return v.filter(x => x && typeof x.emoji === 'string').map(x => ({
+    userId: String(x.userId || ''), name: String(x.name || '').slice(0, 40), emoji: x.emoji, at: x.at || null,
+  }));
+}
+// タスクの表示・受け渡し形（既存項目は kind=decision / phase=intake / 票・申告なしとして後方互換）
+function taskView(t) {
+  return {
+    ...t, due: normalizeDue(t.due), kind: normalizeKind(t.kind), phase: normalizePhase(t.phase),
+    votes: normalizeVotes(t.votes), stances: normalizeStances(t.stances),
+    dominance: t.dominance || null, objections: Array.isArray(t.objections) ? t.objections : [],
+  };
+}
+// 票の集計。分母は全席（Muse席の総数）。賛成側=yes+yes_conditional、反対=no、holdはどちらにも数えない
+function voteSummary(room, t) {
+  const total = seatsOf(room).length;
+  const votes = normalizeVotes(t.votes);
+  const yes = votes.filter(v => v.choice === 'yes').length;
+  const yesConditional = votes.filter(v => v.choice === 'yes_conditional').length;
+  const no = votes.filter(v => v.choice === 'no').length;
+  const hold = votes.filter(v => v.choice === 'hold').length;
+  const votedOwners = new Set(votes.map(v => v.ownerId || '__legacy__'));
+  return {
+    total, yes, yesConditional, yesSide: yes + yesConditional, no, hold,
+    unvoted: Math.max(0, total - votedOwners.size), votedCount: votes.length,
+    majoritySide: (yes + yesConditional) * 2 > total && total > 0 ? 'yes' : (no * 2 > total && total > 0 ? 'no' : null),
+  };
+}
+// ブリッジ呼び出し元の席。global トークンはレガシー席（ownerId=null）専用
+function callerSeat(caller, room) {
+  if (!room) return null;
+  if (caller.kind === 'global') return seatsOf(room).find(s => !s.ownerId) || null;
+  return seatByOwner(room, caller.profile.id);
+}
+// 集約席かどうか（レガシー席、またはルーム作成者の席）
+function isAggregatorSeat(caller, room, seat) {
+  if (!seat) return false;
+  if (!seat.ownerId) return true;
+  return !!room && room.createdBy === seat.ownerId;
+}
+// relay 申告（自分の依頼のみ）。成功したら true
+function applyRelay(caller, requestId) {
+  if (!requestId) return false;
+  const r = db.kapioRequests.find(x => x.id === requestId);
+  if (!r || !bridgeSees(caller, r)) return false;
+  if (!r.relayedAt) { r.relayedAt = now(); }
+  return true;
+}
 const id = () => crypto.randomBytes(8).toString('hex');
 const now = () => new Date().toISOString();
 
@@ -64,7 +143,8 @@ function normalizeDb() {
   }
   delete db.notifications; // v4.1: 通知は保存せず、未読メッセージから組み立てる
   // v4.24: 既存タスクに due が無ければ null を補う（既存フィールドの挙動は変えない）
-  for (const t of db.tasks) { t.due = normalizeDue(t.due); }
+  for (const t of db.tasks) { t.due = normalizeDue(t.due); t.kind = normalizeKind(t.kind); t.phase = normalizePhase(t.phase); if (!Array.isArray(t.votes)) t.votes = []; if (!Array.isArray(t.stances)) t.stances = []; }
+  for (const m of db.messages) { if (!Array.isArray(m.reactions)) m.reactions = []; }
   if (typeof db.seq !== 'number') db.seq = db.messages.reduce((a, m) => Math.max(a, m.seq || 0), 0);
   // v4.3: Muse席を複数席（room.muses）に移行する。ownerId が null の席はレガシー（カピお）席
   for (const room of db.rooms) {
@@ -330,10 +410,10 @@ function roomMembers(roomId) {
 }
 // v4.25: 履歴APIと同じ形の deliveries を組み立てる（ルーム表示用にも再利用）
 function deliveriesFor(room, msgId) {
-  return db.kapioRequests.filter(q => q.triggerMessageId === msgId).map(q => ({ seat_id: q.ownerId ? `muse:${q.ownerId}` : KAPIO_ID, muse_name: seatNameFor(room, q.ownerId), type: q.type, status: q.status, picked_at: q.pickedAt || null, handled_at: q.handledAt || null, created_at: q.createdAt, expires_at: q.expiresAt }));
+  return db.kapioRequests.filter(q => q.triggerMessageId === msgId).map(q => ({ seat_id: q.ownerId ? `muse:${q.ownerId}` : KAPIO_ID, muse_name: seatNameFor(room, q.ownerId), type: q.type, status: q.status, picked_at: q.pickedAt || null, handled_at: q.handledAt || null, created_at: q.createdAt, expires_at: q.expiresAt, relayed: !!q.relayedAt, relayed_at: q.relayedAt || null }));
 }
 function withDeliveries(room, m) { return { ...m, deliveries: deliveriesFor(room, m.id) }; }
-const countsAsUnread = (m, profileId) => m.senderId !== profileId && m.type !== 'system' && m.type !== 'unsent' && m.type !== 'notice';
+const countsAsUnread = (m, profileId) => m.senderId !== profileId && m.type !== 'system' && m.type !== 'unsent' && m.type !== 'notice' && m.type !== 'ops';
 function lastSeqOf(roomId) {
   for (let i = db.messages.length - 1; i >= 0; i--) if (db.messages[i].roomId === roomId) return db.messages[i].seq || 0;
   return 0;
@@ -406,7 +486,7 @@ function roomDetail(room, profileId) {
   return {
     ...roomView(room, profileId),
     decisions: db.decisions.filter(d => d.roomId === room.id),
-    tasks: db.tasks.filter(t => t.roomId === room.id),
+    tasks: db.tasks.filter(t => t.roomId === room.id).map(taskView),
     museActivity: db.kapioRequests
       .filter(r => r.roomId === room.id && r.status === 'pending')
       .map(r => ({ requestId: r.id, type: r.type, state: r.pickedAt ? 'thinking' : 'called', seatId: r.ownerId ? `muse:${r.ownerId}` : KAPIO_ID, name: seatNameFor(room, r.ownerId) })),
@@ -777,6 +857,7 @@ function requestView(r) {
     requested_by: r.requestedBy, created_at: r.createdAt, expires_at: r.expiresAt,
     picked: !!r.pickedAt, picked_at: r.pickedAt || null,
     verdict: r.verdict ? { needs_answer: r.verdict.needsAnswer, title: r.verdict.title } : null,
+    relayed: !!r.relayedAt, relayed_at: r.relayedAt || null,
     trigger: trigger && trigger.type !== 'unsent'
       ? { id: trigger.id, sender_name: trigger.senderName, body: trigger.body, has_image: !!trigger.image }
       : null,
@@ -825,7 +906,8 @@ app.use(express.json({ limit: '4mb' }));
 
 app.get('/api/health', (req, res) => res.json({
   ok: persist.failures < 3,
-  name: 'muse-chat', time: now(),
+  name: 'muse-chat', version: '4.26', time: now(),
+  vapid: { configured: !!webpush, publicKeyPresent: !!VAPID_PUBLIC, privateKeyPresent: !!VAPID_PRIVATE },
   storage: USE_REMOTE ? 'upstash' : 'file',
   lastSaveOkAt: persist.lastOkAt, saveFailures: persist.failures, lastSaveError: persist.lastError,
   bell: { enabled: BELL_ENABLED, sent: bell.sent, failed: bell.failed, dropped: bell.dropped, queued: bell.queue.length, lastOkAt: bell.lastOkAt, lastError: bell.lastError },
@@ -840,7 +922,7 @@ app.get('/source/:name', (req, res) => {
 });
 const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Muse対応チャット 開発ページ</title><style>body{font-family:sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#222}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:left}code{background:#f0f0f0;padding:1px 5px;border-radius:4px}h1{font-size:20px}h2{font-size:16px;margin-top:28px}</style></head><body>'
 + '<h1>Muse対応チャット 開発ページ</h1>'
-+ '<p>現在のバージョン: <strong>v4.25</strong></p>'
++ '<p>現在のバージョン: <strong>v4.26</strong></p>'
 + '<p>このページは、AIサウナ部のみんな（と各自のMuse）がアプリのコードを見て、デバッグや改善ができるようにするための入口です。コードは GitHub の公開リポジトリと同じ内容です。</p>'
 + '<h2>コードの場所</h2>'
 + '<p>GitHub: <a href="https://github.com/shunpei-okamura/muse-chat">github.com/shunpei-okamura/muse-chat</a></p>'
@@ -858,7 +940,7 @@ const DEV_PAGE = '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><me
 + '<h2>Muse への案内</h2>'
 + '<p>デバッグのときは <code>/source/ファイル名</code> で本番で動いているコードをそのまま読めます。不具合の原因と直し方が分かったら、オーナーに提案してください。コードの変更は GitHub 経由で行います。</p>'
 + '<h2>変更履歴（抜粋）</h2>'
-+ '<ul><li>v4.25: 既読の内訳とMuseの処理状況の表示を追加。自分の発言の「既読／既読 N」をタップすると、読んだ人・まだ読んでいない人と、各Muse席の依頼処理状況（依頼なし／未処理／拾った／処理済み／期限切れ、時刻つき）をまとめたシートが開く。ルーム表示用の発言データに deliveries を後方互換な追加で付けた（既存フィールド・データ構造・認証は変更なし）。お知らせ・システム発言など依頼が作られない発言ではMuse欄を「対象外」と表示する</li><li>v4.24: 決めることボードの項目に「回答期限（due）」を追加。ボードで日付を設定・変更・クリアでき、カードに「期限：○月○日」を表示する（前日・当日・超過の未決定項目は控えめに色分け表示）。タスクAPIとブリッジ（作成時の due 任意指定、GET /api/bridge/tasks への due 追加、更新用 POST /api/bridge/task/update）を対応させた。既存タスク・既存フィールドの挙動は変更なし</li><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
++ '<ul><li>v4.26: LINE脱却の全部入り。決めることボードに投票（賛成／条件付き賛成／反対／保留、条件付きは条件必須・賛成側に集計）と割合ゲージ（全席分母・50%目印）、希望条件・譲れない点・温度感の申告、フェーズ（議題立て／条件申告／候補提示／投票／決着／保留）、種別 kind（decision／ops）を追加。決着は集約席の優勢宣言→24時間の異議窓（譲れない点に触れる場合のみ有効）→decisions登録＋完了で確定し、過半数なしは保留へ。ブリッジに vote／stance／relay／declare／object／finalize／reaction（Museは👀のみ）を追加し、task/update で完了（done）もできるようにした。bridge/post の ops:true はボードの kind=ops 項目として登録され、トーク・未読・プッシュ・依頼の対象外。プッシュは状態表示（許可・購読・VAPID有無）とテスト送信で切り分け可能に。リアクション（人間は👍👀✅）を追加（票ではない旨を明記）。返信スタイルの選択欄は撤去し「自動返信：オン（全席共通ルール）」の状態表示に変更。内蔵指示文を v2026-11-28版に差し替え（運用系変更依頼の扱い・ノイズ削減・分類Aは100字一律・有効期限は全種別24時間）</li><li>v4.25: 既読の内訳とMuseの処理状況の表示を追加。自分の発言の「既読／既読 N」をタップすると、読んだ人・まだ読んでいない人と、各Muse席の依頼処理状況（依頼なし／未処理／拾った／処理済み／期限切れ、時刻つき）をまとめたシートが開く。ルーム表示用の発言データに deliveries を後方互換な追加で付けた（既存フィールド・データ構造・認証は変更なし）。お知らせ・システム発言など依頼が作られない発言ではMuse欄を「対象外」と表示する</li><li>v4.24: 決めることボードの項目に「回答期限（due）」を追加。ボードで日付を設定・変更・クリアでき、カードに「期限：○月○日」を表示する（前日・当日・超過の未決定項目は控えめに色分け表示）。タスクAPIとブリッジ（作成時の due 任意指定、GET /api/bridge/tasks への due 追加、更新用 POST /api/bridge/task/update）を対応させた。既存タスク・既存フィールドの挙動は変更なし</li><li>v4.23: 「決めることボード」（フェーズ1）を追加。ルーム画面に「トーク｜ボード」のタブ切り替えを追加し、ボードの専用ページで既存の決めること（タスク）と決まったことの一覧を表示できるようにした（ボードのタブには未決定件数のバッジ表示つき）。ボードから追加・完了・削除も可能（使うAPIとデータ構造は従来どおりで変更なし）。ボード冒頭にはタスク表が正本である旨の宣言を固定表示する。未決定の項目には備考（どこで止まっているか等）とリマインドON/OFFを持てるようにし、ブリッジのタスク取得にも含めた（21時のリマインド投稿はカピお側の定期実行が担う）。設定モーダルからは要約・決めること・決まったことの表示を外して整理し（データ自体は残す）、全モーダルで外側タップで保存せずに閉じられるようにした。トーク上部の同席中バーは廃止し、ヘッダーのメンバーアイコンからメンバーとMuse席の一覧（同席状態・呼ぶボタンつき）を開く形にした。PDFファイル（1件2MBまで）をトーク添付とブリッジ投稿・返信で送れるようにし、トーク上では📄表示でタップして開ける。あわせて、ルーム設定の中にあった決めることの表はボードに一本化し、設定からはボードへの案内に置き換えた</li><li>v4.22: まとめ（要約）機能を無効化。要約ボタンを撤去し、サーバー側でも summary 依頼を作らないようにした（しゅんぺい指示）</li><li>v4.21: お知らせボタンのアイコンを通知ベルと区別して「🆕」に変更。過去のアップデート告知をお知らせへ移す管理API（POST /api/bridge/admin/mark-notice）を追加し、既存の告知をトーク欄からお知らせへ整理した</li><li>v4.20: 「お知らせ」を追加。bridge/post に notice:true を付けた投稿はトーク欄に出ず（未読・プッシュ・依頼の対象にもならない）、ヘッダーのお知らせ一覧と bridge/pending の notices で読める。アップデート告知は今後こちらへ出す</li><li>v4.19: 未回答一覧の項目タップで元の発言へ飛べない問題を修正。初期表示は最新100件のみで古い発言が画面に無いと飛べなかったため、タップ時に過去分を遡って読み込んでからスクロールするようにした</li><li>v4.18: 未回答一覧の「判定前」表示を一旦取りやめ、要回答と判定されたものだけを出す形に戻した（判定前の依頼自体は残る。他席の判定が進むまでの暫定措置）</li><li>v4.17: 未回答の判定登録API（POST /api/bridge/verdict）を追加。各Museが自分の依頼に「要回答かどうか」と題名を登録でき、バーの件数と未回答一覧に出るのは要回答のものだけにした。判定前の依頼は一覧に別枠で薄く出し、回答不要は出さない。一覧の項目は登録された題名を主表示にし、タップで元の発言へスクロールする</li><li>v4.16: トーク画面下部の「○○が考え中」表示をやめ、席ごとの未回答件数をオーナー名で出す形に変更（例：「ひろむ 未回答1件、コウ 未回答2件」。0件の席は出さず、全席0件ならバー自体を出さない）。未回答件数は依頼の作成・完了・期限切れのたびに配信し、ルーム表示時にも渡す。バーをタップすると未回答一覧（席ごと・要旨・いつ・誰から、読み取り専用）も見える</li><li>v4.15: 呼び鈴（Cloudflare）への写しの送信を追加。発言・依頼・送信取消・席の一覧を呼び鈴へ送り、各Museのリスナーは呼び鈴だけにつなぐ（Renderが会話の無い間は寝られるように）。BELL_URL・BELL_SECRET が無い場合は従来どおり。/api/health に bell の送信状況を追加</li><li>v4.14: ブリッジ用イベントストリーム（GET /api/bridge/events、SSE）を追加。見張りがポーリングではなくサーバーからのプッシュで新規メッセージ・新規リクエストを即検知できるように（Last-Event-ID での再接続再生つき）</li><li>v4.13: 席の表示を「席名（オーナー名）」に変更。「決めること（タスク）」を追加（ルーム設定から追加・完了でき、ブリッジからも登録・確認できる）</li><li>v4.12: チャット本文のURLをタップできるリンクに変更</li><li>v4.11: ブリッジ投稿・返信で画像（data URL、最大4枚）を送れるように</li><li>v4.10: 席を外す管理用API（/api/bridge/admin/release-seat）を追加</li><li>v4.9: 履歴（/api/bridge/history）の各発言に配信状況（deliveries）を追加。どの席へ依頼が作られ、拾われ、処理されたかを確認できるように</li><li>v4.8: 依頼の有効期限を全種別24時間に統一。履歴取得（/api/bridge/history）を追加し、見張りが宛先に関係なく全発言を検知できるように。連鎖防止は自発投稿（オーナーの指示による投稿）を人間の発言と同扱いにし、ブロック対象から外した</li><li>v4.7: Muse席の発言でも名指し・全体宛なら他の席へ依頼を作るよう変更（Muse同士の連鎖は4件で停止）</li><li>v4.6: 開発ページ（/dev）とソース公開（/source）を追加</li><li>v4.4.2: bridge/post が room_name でも送れるように</li><li>v4.4.1: 返信スタイルを自動に固定、名指しされた発言はその席にだけ依頼</li><li>v4.4: 全体宛の相談（group）、自発投稿（bridge/post）</li><li>v4.3.3: アプリ内蔵の指示文を承認コンソール方式に統合</li></ul>'
 + '</body></html>';
 app.get('/dev', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(DEV_PAGE); });
 
@@ -1010,6 +1092,20 @@ app.post('/api/messages/:msgId/unsend', auth, (req, res) => {
   bellUnsent(msg);
   res.json(msg);
 });
+// v4.26: リアクション（人間は 👍👀✅ のみ。リアクションは票ではない）
+app.post('/api/rooms/:id/messages/:mid/reaction', auth, requireMember, (req, res) => {
+  const msg = db.messages.find(m => m.id === req.params.mid && m.roomId === req.room.id);
+  if (!msg) return res.status(404).json({ error: 'message not found' });
+  const emoji = String((req.body && req.body.emoji) || '');
+  if (!HUMAN_REACTIONS.includes(emoji)) return res.status(400).json({ error: 'reaction must be one of 👍 👀 ✅' });
+  const reactions = normalizeReactions(msg.reactions);
+  const idx = reactions.findIndex(r => r.userId === req.profile.id && r.emoji === emoji);
+  if (idx >= 0) reactions.splice(idx, 1); // 同じリアクションはトグルで外す
+  else reactions.push({ userId: req.profile.id, name: req.profile.name, emoji, at: now() });
+  msg.reactions = reactions;
+  updateMessage(msg);
+  res.json({ ...msg, deliveries: deliveriesFor(req.room, msg.id) });
+});
 app.post('/api/rooms/:id/read', auth, requireMember, (req, res) => {
   markRoomRead(req.room.id, req.profile.id);
   save();
@@ -1084,16 +1180,16 @@ app.delete('/api/rooms/:id/decisions/:decId', auth, requireMember, (req, res) =>
 });
 
 // tasks（v4.13: 決めること）
-app.get('/api/rooms/:id/tasks', auth, requireMember, (req, res) => res.json(db.tasks.filter(t => t.roomId === req.room.id)));
+app.get('/api/rooms/:id/tasks', auth, requireMember, (req, res) => res.json(db.tasks.filter(t => t.roomId === req.room.id).map(taskView)));
 app.post('/api/rooms/:id/tasks', auth, requireMember, (req, res) => {
   const text = String(req.body.text || '').trim().slice(0, 300);
   if (!text) return res.status(400).json({ error: 'text required' });
   const dueCreate = parseDueField(req.body);
   if (dueCreate === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
-  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false, due: dueCreate === undefined ? null : dueCreate };
+  const t = { id: id(), roomId: req.room.id, text, done: false, createdByName: req.profile.name, createdAt: now(), doneAt: null, note: '', remind: false, due: dueCreate === undefined ? null : dueCreate, kind: normalizeKind(req.body.kind), phase: normalizePhase(req.body.phase), votes: [], stances: [], dominance: null, objections: [] };
   db.tasks.push(t);
   save();
-  res.json(t);
+  res.json(taskView(t));
 });
 // v4.23追加: 備考（note）とリマインドON/OFF（remind）の更新。完了済みには付けない
 // v4.24追加: 回答期限（due）の更新もここで扱う。due は null でクリア可
@@ -1106,8 +1202,45 @@ app.post('/api/rooms/:id/tasks/:taskId/update', auth, requireMember, (req, res) 
   if (typeof req.body.note === 'string') t.note = req.body.note.trim().slice(0, 500);
   if (typeof req.body.remind === 'boolean') t.remind = req.body.remind;
   if (dueUpd !== undefined) t.due = dueUpd;
+  if ('phase' in req.body) { if (!TASK_PHASES.includes(req.body.phase)) return res.status(400).json({ error: 'invalid phase' }); t.phase = req.body.phase; }
+  if ('kind' in req.body) { if (!TASK_KINDS.includes(req.body.kind)) return res.status(400).json({ error: 'invalid kind' }); t.kind = req.body.kind; }
   save();
-  res.json(t);
+  res.json(taskView(t));
+});
+
+// v4.26: 人間がボードから直接投票・申告する（自分のオーナー分として登録。Muse経由の票と同一枠で上書きし合う）
+function humanTaskOr404(req, res) {
+  const t = db.tasks.find(x => x.id === req.params.taskId && x.roomId === req.room.id);
+  if (!t) { res.status(404).json({ error: 'task not found' }); return null; }
+  return t;
+}
+app.post('/api/rooms/:id/tasks/:taskId/vote', auth, requireMember, (req, res) => {
+  const t = humanTaskOr404(req, res); if (!t) return;
+  const choice = req.body && req.body.choice;
+  if (!VOTE_CHOICES.includes(choice)) return res.status(400).json({ error: 'choice must be yes / yes_conditional / no / hold' });
+  const condition = String((req.body && req.body.condition) || '').trim().slice(0, 200);
+  if (choice === 'yes_conditional' && !condition) return res.status(400).json({ error: 'condition is required for yes_conditional' });
+  const option = String((req.body && req.body.option) || '').trim().slice(0, 60) || null;
+  const votes = normalizeVotes(t.votes).filter(v => (v.ownerId || null) !== req.profile.id);
+  votes.push({ ownerId: req.profile.id, seatName: req.profile.name, choice, option, condition: condition || null, registeredBy: 'human', updatedAt: now() });
+  t.votes = votes;
+  save();
+  res.json({ ok: true, task: taskView(t), vote_summary: voteSummary(req.room, t) });
+});
+app.post('/api/rooms/:id/tasks/:taskId/stance', auth, requireMember, (req, res) => {
+  const t = humanTaskOr404(req, res); if (!t) return;
+  const temperature = (req.body && req.body.temperature) || null;
+  if (temperature !== null && !STANCE_TEMPS.includes(temperature)) return res.status(400).json({ error: 'temperature must be high / mid / low' });
+  const stances = normalizeStances(t.stances).filter(x => (x.ownerId || null) !== req.profile.id);
+  stances.push({
+    ownerId: req.profile.id, seatName: req.profile.name,
+    conditions: String((req.body && req.body.conditions) || '').trim().slice(0, 500),
+    nonNegotiables: String((req.body && (req.body.non_negotiables ?? req.body.nonNegotiables)) || '').trim().slice(0, 500),
+    temperature, registeredBy: 'human', updatedAt: now(),
+  });
+  t.stances = stances;
+  save();
+  res.json({ ok: true, task: taskView(t) });
 });
 app.post('/api/rooms/:id/tasks/:taskId/done', auth, requireMember, (req, res) => {
   const t = db.tasks.find(x => x.id === req.params.taskId && x.roomId === req.room.id);
@@ -1115,7 +1248,7 @@ app.post('/api/rooms/:id/tasks/:taskId/done', auth, requireMember, (req, res) =>
   t.done = true;
   t.doneAt = now();
   save();
-  res.json(t);
+  res.json(taskView(t));
 });
 app.delete('/api/rooms/:id/tasks/:taskId', auth, requireMember, (req, res) => {
   db.tasks = db.tasks.filter(t => !(t.id === req.params.taskId && t.roomId === req.room.id));
@@ -1153,6 +1286,25 @@ app.post('/api/push/subscribe', auth, (req, res) => {
   db.pushSubs.push({ profileId: req.profile.id, endpoint: sub.endpoint, subscription: sub, createdAt: now() });
   save();
   res.json({ ok: true });
+});
+
+// v4.26: テストプッシュ（自分宛のみ）。VAPID未設定・購読なしは理由を返して切り分け可能にする
+app.post('/api/push/test', auth, async (req, res) => {
+  if (!webpush) return res.status(503).json({ ok: false, error: 'サーバーにVAPIDキーが設定されていないため、プッシュを送れません', vapidConfigured: false });
+  const subs = db.pushSubs.filter(x => x.profileId === req.profile.id);
+  if (!subs.length) return res.status(400).json({ ok: false, error: 'この端末の購読が登録されていません。通知を許可してから開き直してください', vapidConfigured: true, subscriptions: 0 });
+  let sent = 0, failed = 0;
+  for (const s of subs) {
+    try {
+      await webpush.sendNotification(s.subscription, JSON.stringify({ title: 'Muse対応チャット', body: 'テスト通知です。届いていればプッシュは正常です', roomId: null }));
+      sent++;
+    } catch (err) {
+      failed++;
+      if (err && (err.statusCode === 404 || err.statusCode === 410)) db.pushSubs = db.pushSubs.filter(x => x.endpoint !== s.endpoint);
+    }
+  }
+  if (failed) save();
+  res.json({ ok: sent > 0, vapidConfigured: true, subscriptions: subs.length, sent, failed });
 });
 
 // ---------- bridge API (Muse) ----------
@@ -1314,6 +1466,14 @@ app.post('/api/bridge/post', bridgeAuth, (req, res) => {
   if (req.bridge.kind === 'global') seat = seatsOf(room).find(s => !s.ownerId) || null;
   else seat = seatByOwner(room, req.bridge.profile.id);
   if (!seat) return res.status(403).json({ error: 'no seat in this room' });
+  // v4.26: ops:true の投稿は運用系の変更依頼として、トーク・未読・プッシュ・依頼の対象にせず、決めることボードの kind=ops 項目として登録する（設計案ステップ2 S2-2）
+  if (req.body && req.body.ops === true) {
+    if (!body) return res.status(400).json({ error: 'body required for ops' });
+    const ot = { id: id(), roomId: room.id, text: body.slice(0, 300), done: false, createdByName: seat.name || 'Muse', createdAt: now(), doneAt: null, note: body.length > 300 ? body.slice(0, 500) : '', remind: false, due: null, kind: 'ops', phase: 'intake', votes: [], stances: [], dominance: null, objections: [] };
+    db.tasks.push(ot);
+    save();
+    return res.json({ ok: true, ops: true, task_id: ot.id, task: taskView(ot) });
+  }
   // v4.20: notice:true の投稿は「お知らせ」になる（トーク欄に出ず、依頼も作らない）
   if (req.body && req.body.notice === true) {
     const m = postMessage(room.id, seatIdOf(seat), seat.name || 'Muse', body, 'notice', null, { via: 'post' });
@@ -1352,10 +1512,10 @@ app.post('/api/bridge/task', bridgeAuth, (req, res) => {
   const seat = req.bridge.kind === 'global' ? null : seatByOwner(room, req.bridge.profile.id);
   const dueBridge = parseDueField(req.body);
   if (dueBridge === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
-  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false, due: dueBridge === undefined ? null : dueBridge };
+  const t = { id: id(), roomId: room.id, text, done: false, createdByName: seat ? (seat.name || 'Muse') : KAPIO_NAME, createdAt: now(), doneAt: null, note: '', remind: false, due: dueBridge === undefined ? null : dueBridge, kind: normalizeKind(req.body && req.body.kind), phase: normalizePhase(req.body && req.body.phase), votes: [], stances: [], dominance: null, objections: [] };
   db.tasks.push(t);
   save();
-  res.json({ ok: true, task: t });
+  res.json({ ok: true, task: taskView(t) });
 });
 app.get('/api/bridge/tasks', bridgeAuth, (req, res) => {
   touchBridge(req.bridge);
@@ -1364,7 +1524,7 @@ app.get('/api/bridge/tasks', bridgeAuth, (req, res) => {
   if (req.query.room_name) rooms = rooms.filter(r => r.name === String(req.query.room_name));
   if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
   const tasks = db.tasks.filter(t => !t.done && rooms.some(r => r.id === t.roomId))
-    .map(t => ({ id: t.id, room_id: t.roomId, room_name: (rooms.find(r => r.id === t.roomId) || {}).name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true, due: normalizeDue(t.due) }));
+    .map(t => { const room = rooms.find(r => r.id === t.roomId) || {}; const v = taskView(t); return { id: t.id, room_id: t.roomId, room_name: room.name || null, text: t.text, created_by_name: t.createdByName, created_at: t.createdAt, note: t.note || '', remind: t.remind === true, due: normalizeDue(t.due), kind: v.kind, phase: v.phase, votes: v.votes, stances: v.stances, dominance: v.dominance, objections: v.objections, vote_summary: voteSummary(room, t) }; });
   res.json({ ok: true, tasks });
 });
 // v4.24: 既存タスクの due / note / remind を更新するブリッジAPI。その席があるルームのタスクのみ操作可（globalトークンも可）。due は null でクリア可
@@ -1378,14 +1538,178 @@ app.post('/api/bridge/task/update', bridgeAuth, (req, res) => {
   if (!room) return res.status(404).json({ error: 'room not found' });
   const hasSeat = req.bridge.kind === 'global' ? seatsOf(room).length > 0 : !!seatByOwner(room, req.bridge.profile.id);
   if (!hasSeat) return res.status(403).json({ error: 'no seat in this room' });
-  if (t.done) return res.status(400).json({ error: 'task already done' });
+  const wantDone = !!(req.body && 'done' in req.body);
+  if (t.done && !(wantDone && req.body.done === false)) return res.status(400).json({ error: 'task already done' });
   const dueBUpd = parseDueField(req.body);
   if (dueBUpd === 'invalid') return res.status(400).json({ error: 'due must be YYYY-MM-DD or null' });
   if (typeof (req.body && req.body.note) === 'string') t.note = req.body.note.trim().slice(0, 500);
   if (typeof (req.body && req.body.remind) === 'boolean') t.remind = req.body.remind;
   if (dueBUpd !== undefined) t.due = dueBUpd;
+  if (req.body && 'phase' in req.body) { if (!TASK_PHASES.includes(req.body.phase)) return res.status(400).json({ error: 'invalid phase' }); t.phase = req.body.phase; }
+  if (req.body && 'kind' in req.body) { if (!TASK_KINDS.includes(req.body.kind)) return res.status(400).json({ error: 'invalid kind' }); t.kind = req.body.kind; }
+  // v4.26 (A-1): ブリッジから完了できる。decisions への登録はしない（確定は finalize 経由のみ）
+  if (wantDone) {
+    if (req.body.done === true) { t.done = true; t.doneAt = now(); if (['intake', 'conditions', 'candidates', 'voting'].includes(t.phase)) t.phase = 'decided'; }
+    else if (req.body.done === false) { t.done = false; t.doneAt = null; }
+    else return res.status(400).json({ error: 'done must be boolean' });
+  }
   save();
-  res.json({ ok: true, task: t });
+  res.json({ ok: true, task: taskView(t) });
+});
+
+// ---------- v4.26: 投票・申告・relay・決着・リアクション（ブリッジ） ----------
+// 自分の席があるルームのタスクを引く共通処理。引けなければレスポンスを書いて null
+function bridgeTaskFor(req, res) {
+  touchBridge(req.bridge);
+  const taskId = req.body && (req.body.task_id || req.body.id);
+  if (!taskId) { res.status(400).json({ error: 'task_id required' }); return null; }
+  const t = db.tasks.find(x => x.id === taskId);
+  if (!t) { res.status(404).json({ error: 'task not found' }); return null; }
+  const room = roomById(t.roomId);
+  if (!room) { res.status(404).json({ error: 'room not found' }); return null; }
+  const seat = callerSeat(req.bridge, room);
+  if (!seat) { res.status(403).json({ error: 'no seat in this room' }); return null; }
+  return { t, room, seat };
+}
+// 投票（自分の席分のみ。1オーナー1票・上書き可。yes_conditional は condition 必須、集計は賛成側）
+app.post('/api/bridge/task/vote', bridgeAuth, (req, res) => {
+  const ctx = bridgeTaskFor(req, res); if (!ctx) return;
+  const { t, room, seat } = ctx;
+  const choice = req.body && req.body.choice;
+  if (!VOTE_CHOICES.includes(choice)) return res.status(400).json({ error: 'choice must be yes / yes_conditional / no / hold' });
+  const condition = String((req.body && req.body.condition) || '').trim().slice(0, 200);
+  if (choice === 'yes_conditional' && !condition) return res.status(400).json({ error: 'condition is required for yes_conditional' });
+  const option = String((req.body && req.body.option) || '').trim().slice(0, 60) || null;
+  const ownerId = seat.ownerId || null;
+  const votes = normalizeVotes(t.votes).filter(v => (v.ownerId || null) !== ownerId);
+  votes.push({ ownerId, seatName: seat.name || 'Muse', choice, option, condition: condition || null, registeredBy: 'muse', updatedAt: now() });
+  t.votes = votes;
+  const relayed = applyRelay(req.bridge, req.body && req.body.request_id);
+  save();
+  res.json({ ok: true, task: taskView(t), vote_summary: voteSummary(room, t), relayed });
+});
+// 申告（希望条件・譲れない点・温度感。自分の席分のみ、1オーナー1件・上書き可。全てボード公開）
+app.post('/api/bridge/task/stance', bridgeAuth, (req, res) => {
+  const ctx = bridgeTaskFor(req, res); if (!ctx) return;
+  const { t, room, seat } = ctx;
+  const temperature = (req.body && req.body.temperature) || null;
+  if (temperature !== null && !STANCE_TEMPS.includes(temperature)) return res.status(400).json({ error: 'temperature must be high / mid / low' });
+  const ownerId = seat.ownerId || null;
+  const stances = normalizeStances(t.stances).filter(x => (x.ownerId || null) !== ownerId);
+  stances.push({
+    ownerId, seatName: seat.name || 'Muse',
+    conditions: String((req.body && req.body.conditions) || '').trim().slice(0, 500),
+    nonNegotiables: String((req.body && (req.body.non_negotiables ?? req.body.nonNegotiables)) || '').trim().slice(0, 500),
+    temperature, registeredBy: 'muse', updatedAt: now(),
+  });
+  t.stances = stances;
+  const relayed = applyRelay(req.bridge, req.body && req.body.request_id);
+  save();
+  res.json({ ok: true, task: taskView(t), relayed });
+});
+// relay 申告（依頼単位。「オーナーへ取り次いだ」ことの自己申告。自分の依頼のみ）
+app.post('/api/bridge/relay', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const r = db.kapioRequests.find(x => x.id === (req.body && req.body.request_id));
+  if (!r) return res.status(404).json({ error: 'request not found' });
+  if (!bridgeSees(req.bridge, r)) return res.status(403).json({ error: 'this request belongs to another Muse' });
+  if (req.body && req.body.relayed === false) { r.relayedAt = null; save(); return res.json({ ok: true, relayed: false }); }
+  r.relayedAt = now();
+  save();
+  res.json({ ok: true, relayed: true, relayed_at: r.relayedAt });
+});
+// 優勢宣言（集約席のみ）。分母は全席、賛成側=yes+yes_conditional、反対=no、holdは数えない。
+// 過半数（>50%）があれば、期限前・未投票が残っていても覆らないため宣言できる
+app.post('/api/bridge/task/declare', bridgeAuth, (req, res) => {
+  const ctx = bridgeTaskFor(req, res); if (!ctx) return;
+  const { t, room, seat } = ctx;
+  if (!isAggregatorSeat(req.bridge, room, seat)) return res.status(403).json({ error: 'declare is for the aggregator seat only' });
+  if (t.done) return res.status(400).json({ error: 'task already done' });
+  const sum = voteSummary(room, t);
+  const side = (req.body && req.body.side) || sum.majoritySide;
+  if (side && !['yes', 'no'].includes(side)) return res.status(400).json({ error: 'side must be yes / no' });
+  const sideCount = side === 'yes' ? sum.yesSide : side === 'no' ? sum.no : 0;
+  if (!side || sum.total === 0 || !(sideCount * 2 > sum.total)) {
+    // 過半数なしは決着を宣言せず parked へ切り分けるのが確定形。宣言自体はエラーで返す
+    return res.status(409).json({ error: 'no majority: neither side exceeds 50% of all seats', vote_summary: sum, hint: 'move this task to parked via task/update phase' });
+  }
+  const declaredAt = now();
+  t.dominance = { side, declaredAt, declaredBy: seat.name || 'Muse', objectionDeadline: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), status: 'declared' };
+  if (t.phase !== 'decided') t.phase = 'voting';
+  save();
+  res.json({ ok: true, task: taskView(t), vote_summary: sum, dominance: t.dominance });
+});
+// 異議申立て（優勢宣言の24時間窓内のみ。有効なのは「自分の譲れない点に触れる」場合だけ）
+app.post('/api/bridge/task/object', bridgeAuth, (req, res) => {
+  const ctx = bridgeTaskFor(req, res); if (!ctx) return;
+  const { t, room, seat } = ctx;
+  if (!t.dominance || t.dominance.status !== 'declared') return res.status(409).json({ error: 'no active dominance declaration' });
+  if (Date.now() > Date.parse(t.dominance.objectionDeadline)) return res.status(409).json({ error: 'objection window closed' });
+  const reason = String((req.body && req.body.reason) || '').trim().slice(0, 500);
+  if (!reason) return res.status(400).json({ error: 'reason is required' });
+  const ownerId = seat.ownerId || null;
+  const myStance = normalizeStances(t.stances).find(x => (x.ownerId || null) === ownerId);
+  if (!myStance || !myStance.nonNegotiables) {
+    return res.status(400).json({ error: 'objection is valid only when it touches your declared non-negotiables (stance の non_negotiables が必要です)' });
+  }
+  const objection = { ownerId, seatName: seat.name || 'Muse', reason, nonNegotiables: myStance.nonNegotiables, at: now(), valid: true };
+  t.objections = [...(Array.isArray(t.objections) ? t.objections : []), objection];
+  t.dominance = { ...t.dominance, status: 'objected' };
+  const reopen = req.body && req.body.reopen;
+  t.phase = reopen === 'conditions' ? 'conditions' : 'parked';
+  if (t.phase === 'parked') t.due = null;
+  const noteLine = `【異議により${t.phase === 'parked' ? '保留' : '条件申告へ差し戻し'}】${seat.name || 'Muse'}：${reason}（譲れない点：${myStance.nonNegotiables}）`;
+  t.note = ((t.note || '') + '\n' + noteLine).trim().slice(0, 500);
+  save();
+  res.json({ ok: true, task: taskView(t), objection });
+});
+// 確定（集約席のみ。異議窓を過ぎ、有効な異議が無い場合に decisions 登録＋完了＋phase=decided）
+app.post('/api/bridge/task/finalize', bridgeAuth, (req, res) => {
+  const ctx = bridgeTaskFor(req, res); if (!ctx) return;
+  const { t, room, seat } = ctx;
+  if (!isAggregatorSeat(req.bridge, room, seat)) return res.status(403).json({ error: 'finalize is for the aggregator seat only' });
+  if (t.done) return res.status(400).json({ error: 'task already done' });
+  if (!t.dominance || t.dominance.status !== 'declared') return res.status(409).json({ error: 'no active dominance declaration (or already objected)' });
+  if (Date.now() < Date.parse(t.dominance.objectionDeadline)) {
+    return res.status(409).json({ error: 'objection window still open', objection_deadline: t.dominance.objectionDeadline });
+  }
+  const validObjections = (t.objections || []).filter(o => o && o.valid);
+  if (validObjections.length) return res.status(409).json({ error: 'valid objection exists', objections: validObjections });
+  const side = t.dominance.side;
+  let decisionText = side === 'yes' ? `決定：${t.text}` : `見送り：${t.text}（反対側が優勢）`;
+  if (side === 'yes') {
+    const conds = normalizeVotes(t.votes).filter(v => v.choice === 'yes_conditional' && v.condition).map(v => v.condition);
+    if (conds.length) decisionText += `（条件：${conds.join('／')}）`;
+  }
+  const d = { id: id(), roomId: room.id, text: decisionText.slice(0, 300), createdBy: seatIdOf(seat), createdAt: now() };
+  db.decisions.push(d);
+  t.done = true;
+  t.doneAt = now();
+  t.phase = 'decided';
+  t.dominance = { ...t.dominance, status: 'finalized', finalizedAt: now() };
+  save();
+  res.json({ ok: true, task: taskView(t), decision: d });
+});
+// リアクション（Museは 👀 のみ。リアクションは票ではない）
+app.post('/api/bridge/reaction', bridgeAuth, (req, res) => {
+  touchBridge(req.bridge);
+  const emoji = String((req.body && req.body.emoji) || '');
+  if (!MUSE_REACTIONS.includes(emoji)) return res.status(400).json({ error: 'Muse reactions are limited to 👀' });
+  const msg = db.messages.find(m => m.id === (req.body && req.body.message_id));
+  if (!msg) return res.status(404).json({ error: 'message not found' });
+  const room = roomById(msg.roomId);
+  if (!room) return res.status(404).json({ error: 'room not found' });
+  if (req.body && req.body.room_id && req.body.room_id !== msg.roomId) return res.status(400).json({ error: 'room_id mismatch' });
+  const seat = callerSeat(req.bridge, room);
+  if (!seat) return res.status(403).json({ error: 'no seat in this room' });
+  const sid = seatIdOf(seat);
+  const reactions = normalizeReactions(msg.reactions);
+  const idx = reactions.findIndex(r => r.userId === sid && r.emoji === emoji);
+  if (idx >= 0) reactions.splice(idx, 1);
+  else reactions.push({ userId: sid, name: seat.name || 'Muse', emoji, at: now() });
+  msg.reactions = reactions;
+  updateMessage(msg);
+  res.json({ ok: true, message_id: msg.id, reactions });
 });
 // v4.8: ルーム履歴の取得（見張りが pending の有無に関係なく全発言を検知するため。自分の席があるルームのみ）
 app.get('/api/bridge/history', bridgeAuth, (req, res) => {
@@ -1398,7 +1722,7 @@ app.get('/api/bridge/history', bridgeAuth, (req, res) => {
   if ((req.query.room_id || req.query.room_name) && !rooms.length) return res.status(404).json({ error: 'room not found' });
   res.json({ ok: true, rooms: rooms.map(r => {
     const all = db.messages.filter(m => m.roomId === r.id && m.type !== 'unsent' && (!sinceMs || Date.parse(m.createdAt) > sinceMs));
-    return { room_id: r.id, room_name: r.name, messages: all.slice(-limit).map(m => ({ id: m.id, sender_id: m.senderId, sender_name: m.senderName, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, reply_to: m.replyTo || null, created_at: m.createdAt, deliveries: deliveriesFor(r, m.id) })) };
+    return { room_id: r.id, room_name: r.name, messages: all.slice(-limit).map(m => ({ id: m.id, sender_id: m.senderId, sender_name: m.senderName, body: m.body || (m.image ? '（画像を送信しました）' : ''), type: m.type, reply_to: m.replyTo || null, created_at: m.createdAt, reactions: normalizeReactions(m.reactions), deliveries: deliveriesFor(r, m.id) })) };
   }) });
 });
 // bridge admin (global bridge only)
