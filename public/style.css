@@ -259,3 +259,12 @@ button:focus-visible { outline: 2px solid #0984e3; outline-offset: 2px; }
 .reaction-btns { display: flex; gap: 8px; justify-content: center; }
 .reaction-btns button { font-size: 26px; padding: 10px 18px; }
 .reaction-note { text-align: center; }
+
+/* v4.27: proposal */
+.board-proposal { margin-top: 8px; background: #fff; border: 1px solid #b8ccf5; border-radius: 8px; padding: 6px 8px; }
+.board-proposal-head { font-size: 12px; font-weight: 600; color: #1a56db; }
+.board-proposal-text { font-size: 14px; font-weight: 600; white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
+.board-proposal-meta { font-size: 12px; color: #777; margin: 2px 0 4px; }
+.board-no-proposal { display: flex; gap: 8px; align-items: center; color: #8a6d1a; font-size: 13px; }
+.board-no-proposal-note { font-size: 13px; color: #8a6d1a; }
+.board-proposal-input { width: 100%; box-sizing: border-box; font-size: 13px; margin-top: 4px; }

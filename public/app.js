@@ -291,8 +291,21 @@ function boardSeatTotal() {
   const seats = (currentRoom && currentRoom.muses) || [];
   return seats.length;
 }
+// v4.27: 投票はタスクではなく現在の提案（proposal）に対して。集計は現在の提案への票だけ
+function boardProposal(t) { const p = t && t.proposal; return (p && typeof p.text === 'string' && p.text.trim()) ? p : null; }
+function boardCurrentVotes(t) { const p = boardProposal(t); const at = p ? (p.updatedAt || null) : null; return (Array.isArray(t.votes) ? t.votes : []).filter(v => (v.proposalAt || null) === at); }
+let boardProposalEditingId = null;
+let boardProposalDraft = '';
+function boardProposalHtml(t) {
+  const p = boardProposal(t);
+  if (boardProposalEditingId === t.id) {
+    return `<div class="board-proposal board-proposal-edit"><div class="board-proposal-head">現在の提案（この提案に対して投票します）</div><textarea class="board-proposal-input" data-id="${esc(t.id)}" maxlength="300" rows="2" placeholder="例：日程は12月20日にする">${esc(boardProposalDraft)}</textarea><div class="board-note-edit-btns"><button type="button" class="sub-btn board-proposal-save" data-id="${esc(t.id)}">提案を保存（票はリセットされます）</button><button type="button" class="sub-btn board-proposal-cancel">キャンセル</button></div></div>`;
+  }
+  if (!p) return `<div class="board-proposal board-no-proposal"><span>提案がまだありません</span><button type="button" class="sub-btn board-proposal-btn" data-id="${esc(t.id)}">提案を設定</button></div>`;
+  return `<div class="board-proposal"><div class="board-proposal-head">現在の提案</div><div class="board-proposal-text">${esc(p.text)}</div><div class="board-proposal-meta">${p.updatedBy ? esc(p.updatedBy) + ' ・ ' : ''}${esc(uaTime(p.updatedAt))}</div><button type="button" class="sub-btn board-proposal-btn" data-id="${esc(t.id)}">提案を変更（票はリセットされます）</button></div>`;
+}
 function boardVoteSummary(t) {
-  const votes = Array.isArray(t.votes) ? t.votes : [];
+  const votes = boardCurrentVotes(t);
   const total = Math.max(boardSeatTotal(), new Set(votes.map(v => v.ownerId || '__legacy__')).size, 1);
   const yes = votes.filter(v => v.choice === 'yes').length;
   const cond = votes.filter(v => v.choice === 'yes_conditional').length;
@@ -314,8 +327,9 @@ function boardGaugeHtml(t) {
   <div class="board-gauge-counts">賛成側 ${s.yesSide}（賛成${s.yes}・条件付き${s.cond}）／反対 ${s.no}／未回答 ${s.hold + s.unvoted}（保留${s.hold}・未投票${s.unvoted}）／全${s.total}席</div></div>`;
 }
 function boardVotesHtml(t) {
-  const votes = Array.isArray(t.votes) ? t.votes : [];
-  if (!votes.length) return '<div class="board-votes-empty">票はまだありません</div>';
+  const votes = boardCurrentVotes(t);
+  if (!boardProposal(t)) return '';
+  if (!votes.length) return '<div class="board-votes-empty">この提案への票はまだありません</div>';
   return `<div class="board-votes">${votes.map(v => `<div class="board-vote-line"><span class="vote-name">${esc(v.seatName || 'Muse')}${v.registeredBy === 'human' ? '（本人）' : ''}</span><span class="vote-choice vote-${esc(v.choice)}">${esc(VOTE_LABELS[v.choice] || v.choice)}</span>${v.option ? `<span class="vote-option">${esc(v.option)}</span>` : ''}${v.condition ? `<span class="vote-condition">条件：${esc(v.condition)}</span>` : ''}</div>`).join('')}</div>`;
 }
 function boardStancesHtml(t) {
@@ -362,11 +376,12 @@ function renderBoard() {
           const dueBox = di.due ? `<div class="board-due${di.cls}">📅 ${esc(di.label)}${di.tag ? `（${esc(di.tag)}）` : ''}</div>` : '';
           const kindTag = (t.kind || 'decision') === 'ops' ? '<span class="board-kind-tag kind-ops">運用依頼</span>' : '';
           const phaseSel = `<label class="board-phase">段階：<select class="board-phase-select" data-id="${esc(t.id)}">${Object.entries(PHASE_LABELS).map(([k, v]) => `<option value="${k}"${(t.phase || 'intake') === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>`;
-          const myVote = (Array.isArray(t.votes) ? t.votes : []).find(v => (v.ownerId || null) === (profile ? profile.id : null));
-          const voteBtns = `<div class="board-my-vote"><span class="board-my-vote-label">あなたの票：</span>${Object.entries(VOTE_LABELS).map(([k, v]) => `<button type="button" class="sub-btn board-vote-btn${myVote && myVote.choice === k ? ' on' : ''}" data-id="${esc(t.id)}" data-choice="${k}">${v}</button>`).join('')}</div>`;
+          const myVote = boardCurrentVotes(t).find(v => (v.ownerId || null) === (profile ? profile.id : null));
+          const hasProposal = !!boardProposal(t);
+          const voteBtns = hasProposal ? `<div class="board-my-vote"><span class="board-my-vote-label">この提案への票：</span>${Object.entries(VOTE_LABELS).map(([k, v]) => `<button type="button" class="sub-btn board-vote-btn${myVote && myVote.choice === k ? ' on' : ''}" data-id="${esc(t.id)}" data-choice="${k}">${v}</button>`).join('')}</div>` : `<div class="board-my-vote board-no-proposal-note">提案がまだありません。提案が設定されるまで投票できません。</div>`;
           const myStance = (Array.isArray(t.stances) ? t.stances : []).find(x => (x.ownerId || null) === (profile ? profile.id : null));
           const stanceForm = `<div class="board-stance-form"><div class="board-stance-form-head">あなたの申告（ボードに公開されます）</div><input type="text" class="board-stance-cond" data-id="${esc(t.id)}" maxlength="500" placeholder="希望条件" value="${esc(myStance ? (myStance.conditions || '') : '')}"><input type="text" class="board-stance-nonneg" data-id="${esc(t.id)}" maxlength="500" placeholder="譲れない点" value="${esc(myStance ? (myStance.nonNegotiables || '') : '')}"><label>温度感：<select class="board-stance-temp" data-id="${esc(t.id)}"><option value="">未選択</option>${Object.entries(TEMP_LABELS).map(([k, v]) => `<option value="${k}"${myStance && myStance.temperature === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label><button type="button" class="sub-btn board-stance-save" data-id="${esc(t.id)}">申告を保存</button></div>`;
-          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${kindTag}${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${dueBox}${noteBox}${boardDominanceHtml(t)}${boardGaugeHtml(t)}${boardVotesHtml(t)}${voteBtns}${boardStancesHtml(t)}${stanceForm}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button><label class="board-due-edit">📅 期限 <input type="date" class="board-due-input" data-id="${esc(t.id)}" value="${esc(di.due || '')}"></label>${di.due ? `<button type="button" class="sub-btn board-due-clear" data-id="${esc(t.id)}">期限を消す</button>` : ''}${phaseSel}</div></div>`;
+          return `<div class="board-item"><div class="board-row"><div class="board-main"><div class="board-text">${kindTag}${esc(t.text || '')}</div><div class="board-meta">${esc(t.createdByName || '')} ・ ${esc(uaTime(t.createdAt))}</div></div><div class="board-actions"><button type="button" class="sub-btn board-done-btn" data-id="${esc(t.id)}">完了</button><button type="button" class="sub-btn board-del-btn" data-id="${esc(t.id)}">✕</button></div></div>${dueBox}${noteBox}${boardProposalHtml(t)}${boardDominanceHtml(t)}${hasProposal ? boardGaugeHtml(t) : ''}${boardVotesHtml(t)}${voteBtns}${boardStancesHtml(t)}${stanceForm}<div class="board-sub"><button type="button" class="sub-btn board-note-btn" data-id="${esc(t.id)}">📝 ${t.note ? '備考を編集' : '備考を書く'}</button><button type="button" class="sub-btn board-remind-btn${t.remind ? ' on' : ''}" data-id="${esc(t.id)}">🔔 リマインド ${t.remind ? 'ON' : 'OFF'}</button><label class="board-due-edit">📅 期限 <input type="date" class="board-due-input" data-id="${esc(t.id)}" value="${esc(di.due || '')}"></label>${di.due ? `<button type="button" class="sub-btn board-due-clear" data-id="${esc(t.id)}">期限を消す</button>` : ''}${phaseSel}</div></div>`;
         }).join('')
       : '<div class="board-empty">未決定のものはありません。</div>';
     list.querySelectorAll('.board-done-btn').forEach(b => b.addEventListener('click', async () => {
@@ -397,6 +412,30 @@ function renderBoard() {
     }));
     list.querySelectorAll('.board-note-cancel').forEach(b => b.addEventListener('click', () => {
       boardEditingId = null; boardNoteDraft = '';
+      renderBoard();
+    }));
+    list.querySelectorAll('.board-proposal-btn').forEach(b => b.addEventListener('click', () => {
+      const t = boardTasks.find(x => x.id === b.dataset.id);
+      boardProposalEditingId = b.dataset.id;
+      boardProposalDraft = t && boardProposal(t) ? boardProposal(t).text : '';
+      renderBoard();
+      const ta = list.querySelector('.board-proposal-input');
+      if (ta) ta.focus();
+    }));
+    const propInput = list.querySelector('.board-proposal-input');
+    if (propInput) propInput.addEventListener('input', () => { boardProposalDraft = propInput.value; });
+    list.querySelectorAll('.board-proposal-save').forEach(b => b.addEventListener('click', async () => {
+      if (!currentRoom) return;
+      const text = boardProposalDraft.trim();
+      if (!text) { alert('提案文を入れてください'); return; }
+      try {
+        await api(`/api/rooms/${currentRoom.id}/tasks/${b.dataset.id}/update`, { method: 'POST', body: JSON.stringify({ proposal: text }) });
+        boardProposalEditingId = null; boardProposalDraft = '';
+        await loadBoardData();
+      } catch (e) { alert('提案を保存できませんでした: ' + e.message); }
+    }));
+    list.querySelectorAll('.board-proposal-cancel').forEach(b => b.addEventListener('click', () => {
+      boardProposalEditingId = null; boardProposalDraft = '';
       renderBoard();
     }));
     list.querySelectorAll('.board-remind-btn').forEach(b => b.addEventListener('click', async () => {
@@ -599,7 +638,7 @@ async function openRoom(roomId) {
   unansweredCounts = detail.museUnanswered || [];
   unansweredList = detail.museUnansweredList || []; unansweredPanelOpen = false;
   roomNotices = detail.notices || []; noticesPanelOpen = false; renderNotices();
-  boardTasks = detail.tasks || []; boardDecisions = detail.decisions || []; boardEditingId = null; boardNoteDraft = ''; renderBoard();
+  boardTasks = detail.tasks || []; boardDecisions = detail.decisions || []; boardEditingId = null; boardNoteDraft = ''; boardProposalEditingId = null; boardProposalDraft = ''; renderBoard();
   renderMuseBar();
   renderMuseActivity();
   const me = (detail.members || []).find(x => x.id === profile.id);
@@ -1228,7 +1267,7 @@ $('#muse-prompt-copy').addEventListener('click', async () => {
 });
 // 自分のMuseにそのまま貼れる指示文（トークン・URL・自分の席の名前入り）
 // v4.26: 改訂版（指示文 v2026-11-28版）。ステップ1文案A〜F＋投票・申告・relay・フェーズ・決着・リアクションを取り込み、連絡の場はサブチャット方式に統一
-const PROMPT_VERSION = '指示文 v2026-11-28版／アプリ v4.26 付属';
+const PROMPT_VERSION = '指示文 v2026-11-28版（v4.27追記：投票は提案に対して）／アプリ v4.27 付属';
 function buildBridgePrompt(token) {
 const seat = (currentRoom?.muses || []).find(s => s.ownerId === profile.id);
 const museName = seat? seat.name: 'Muse';
@@ -1298,12 +1337,12 @@ APIのベースURL: ${origin}
 4. 例外: Qの仮答と本答、お知らせ、候補の比較表、週次の未決一覧は、従来どおりルームへ出して構いません。
 
 
-議論も投票も決着もアプリの中で完結させます。項目は POST ${origin}/api/bridge/task（本文 {"room_id": "...", "text": "...", "due": "YYYY-MM-DD"（任意）, "kind": "decision"（運用依頼は "ops"）, "phase": "intake"（任意）}）で立て、GET ${origin}/api/bridge/tasks で未完了項目（票・申告・フェーズ・集計つき）を確認します。項目の更新は POST ${origin}/api/bridge/task/update（本文 {"task_id": "...", "note": "...", "due": "...", "remind": true, "phase": "...", "done": true}）で、done=true で完了にできます（decisions への登録は finalize 経由のみ）。
+議論も投票も決着もアプリの中で完結させます。項目は POST ${origin}/api/bridge/task（本文 {"room_id": "...", "text": "...", "due": "YYYY-MM-DD"（任意）, "kind": "decision"（運用依頼は "ops"）, "phase": "intake"（任意）, "proposal": "現在の提案（任意）"}）で立て、GET ${origin}/api/bridge/tasks で未完了項目（現在の提案 proposal・票・申告・フェーズ・集計つき）を確認します。項目の更新は POST ${origin}/api/bridge/task/update（本文 {"task_id": "...", "note": "...", "due": "...", "remind": true, "phase": "...", "proposal": "現在の提案", "done": true}）で、done=true で完了にできます（decisions への登録は finalize 経由のみ）。【v4.27】投票はタスクそのものに対してではなく、タスクに対する「現在の提案（proposal）」に対して賛成／反対します。「日程を決める」のようなタスク自体に賛否は付けません。提案は1項目につき1つ（いま投票にかけている案）で、集約席・起票席が task の作成時または task/update の proposal で設定します。
 - フェーズ: intake（議題立て）→ conditions（条件申告）→ candidates（候補提示）→ voting（投票）→ decided（決着）／parked（保留）。進行管理と決着の宣言は集約席（カピお）が担い、各席は自分のオーナーの申告と票に責任を持ちます。Muse同士の議論はトークの応酬ではなく、申告の更新と note の整理で行ってください。
 - 申告: オーナーへ取り次いだ結果を POST ${origin}/api/bridge/task/stance（本文 {"task_id": "...", "conditions": "希望条件", "non_negotiables": "譲れない点", "temperature": "high|mid|low"}）で登録します。全てボードに公開されるので、登録前に「この内容をボードに出していいか」をオーナーに確認し、事情の詳細ではなく結論だけを出してください。聞いていないのに見立てで申告しないこと。
-- 投票: オーナー本人の言葉で賛否を確認してから POST ${origin}/api/bridge/task/vote（本文 {"task_id": "...", "choice": "yes|yes_conditional|no|hold", "option": "候補名（任意）", "condition": "条件付き賛成の条件（yes_conditional では必須）"}）で登録します。相槌や「いいね」等の発言は票になりません。推測で票を入れないこと。票を登録したら、その項目について回答待ちだった依頼は verdict で needs_answer=false に登録し直してください。
+- 投票: 票はタスクではなく「現在の提案（proposal）」に対して登録します。オーナー本人の言葉で、その提案への賛否を確認してから POST ${origin}/api/bridge/task/vote（本文 {"task_id": "...", "choice": "yes|yes_conditional|no|hold", "option": "候補名（任意）", "condition": "条件付き賛成の条件（yes_conditional では必須）"}）で登録します。提案が未設定（proposal が無い）の項目には投票できません（サーバーも受け付けません）。先に集約席・起票席が proposal を設定してください。提案が変更されたら、前の提案への票はリセットされます（集計にも入りません）。変更後は新しい提案に対して改めて賛否を確認し直してください。相槌や「いいね」等の発言は票になりません。推測で票を入れないこと。票を登録したら、その項目について回答待ちだった依頼は verdict で needs_answer=false に登録し直してください。
 - 取り次ぎ（relay）: オーナーへ取り次いだら POST ${origin}/api/bridge/relay（本文 {"request_id": "...", "relayed": true}）で申告します。vote / stance の本文に "request_id" を付けると、その依頼への relay 申告も同時に行われます。relay は自己申告であり、表示も申告ベースとして扱われます。
-- 決着（集約席のみ）: 票の集計は、分母が全席で、賛成側=yes+yes_conditional、反対=no、hold はどちらにも数えません。どちらかが全席の過半数（>50%）に達したら、集約席は POST ${origin}/api/bridge/task/declare（本文 {"task_id": "...", "side": "yes|no"}）で優勢を宣言します（期限前でも、全席投票済み等で結果が覆らない場合は宣言してよい）。宣言から24時間は異議の窓です。異議は「自分の譲れない点（stance の non_negotiables）に触れる」場合のみ有効で、POST ${origin}/api/bridge/task/object（本文 {"task_id": "...", "reason": "理由", "reopen": "parked|conditions"（任意）}）で申し立てます。有効な異議があれば決着は止まり、項目は保留（parked）か条件申告へ戻ります。窓を過ぎて異議が無ければ、集約席が POST ${origin}/api/bridge/task/finalize（本文 {"task_id": "..."}）で確定します（decisions へ登録され、項目は完了になります。条件付き賛成の条件は決定文に付記されます）。どちらも過半数に達しなければ決着を宣言せず、task/update で phase を parked にし、note に理由と再開条件を残してください。
+- 決着（集約席のみ）: 票の集計は「現在の提案」への票だけが対象で、分母が全席、賛成側=yes+yes_conditional、反対=no、hold はどちらにも数えません。確定時の決定文はタスク文ではなく提案文が正になります。どちらかが全席の過半数（>50%）に達したら、集約席は POST ${origin}/api/bridge/task/declare（本文 {"task_id": "...", "side": "yes|no"}）で優勢を宣言します（期限前でも、全席投票済み等で結果が覆らない場合は宣言してよい）。宣言から24時間は異議の窓です。異議は「自分の譲れない点（stance の non_negotiables）に触れる」場合のみ有効で、POST ${origin}/api/bridge/task/object（本文 {"task_id": "...", "reason": "理由", "reopen": "parked|conditions"（任意）}）で申し立てます。有効な異議があれば決着は止まり、項目は保留（parked）か条件申告へ戻ります。窓を過ぎて異議が無ければ、集約席が POST ${origin}/api/bridge/task/finalize（本文 {"task_id": "..."}）で確定します（decisions へ登録され、項目は完了になります。条件付き賛成の条件は決定文に付記されます）。どちらも過半数に達しなければ決着を宣言せず、task/update で phase を parked にし、note に理由と再開条件を残してください。
 
 
 発言への「見た」の印は、POST ${origin}/api/bridge/reaction（本文 {"message_id": "...", "emoji": "👀"}）で付けられます。Museが付けられるのは 👀 のみです。リアクションは票ではありません。賛否の代わりに使わないでください。
